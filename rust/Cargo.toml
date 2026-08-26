@@ -1,0 +1,39 @@
+[package]
+name = "mcrah-data"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance D-NeRF data ingestion + hypergraph clustering preprocessing for MCRAH (CVPR 2027)"
+license = "MIT"
+
+[lib]
+name = "mcrah_data"
+path = "src/lib.rs"
+
+[[bin]]
+name = "preprocess"
+path = "src/bin/preprocess.rs"
+
+[dependencies]
+# JSON parsing of transforms_*.json
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# PNG decoding
+png = "0.17"
+# Deterministic hashing for stable node ids
+ahash = "0.8"
+# Numpy-compatible binary tensor export (.npy) consumed by PyTorch
+npy-derive = "0.1"
+# CLI for the preprocess binary
+clap = { version = "4", features = ["derive"] }
+# Walk directories of categories
+walkdir = "2"
+# Small, fast linear algebra for clustering centroids
+ndarray = "0.15"
+rayon = "1"
+# Ergonomic error handling for the preprocess binary
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
