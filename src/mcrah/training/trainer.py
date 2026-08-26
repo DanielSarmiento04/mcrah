@@ -159,6 +159,7 @@ class MCRAHTrainer:
         dev = self.device
         H = self.cfg.data.render_wh[1]
         W = self.cfg.data.render_wh[0]
+        bg = torch.ones(3, device=dev) if self.cfg.data.white_background else None
         times = [torch.tensor(s.time, device=dev) for s in window]
         steps = self.model.rollout(times, noise_injector=self.noise)
 
@@ -166,7 +167,7 @@ class MCRAHTrainer:
         for s, step in zip(window, steps):
             K = s.intrinsics.to(dev)
             c2w = s.c2w.to(dev)
-            out = render(step.cloud, c2w, K, width=W, height=H)
+            out = render(step.cloud, c2w, K, width=W, height=H, bg_color=bg)
             preds.append(out.image)
             # Resample the target to the render resolution.
             tgt = s.image.to(dev).unsqueeze(0)  # (1,3,H0,W0)

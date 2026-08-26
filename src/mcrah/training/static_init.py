@@ -55,8 +55,11 @@ def seed_cloud_from_points(
         log_scale = torch.log(nn_d.mean().clamp_min(1e-2)).expand(n, 3).clone()
     else:
         log_scale = torch.full((n, 3), -2.0)
-    # SH: 1 coefficient (DC) when degree 0.
-    sh = torch.zeros(n, 3, device=device)  # neutral gray, refined by training
+    # SH: 1 coefficient (DC) when degree 0. Initialize to a nonzero mid-gray
+    # (0.5) so the rendered image is NOT constant-black. A zero-init sh makes
+    # every Gaussian black, so the rendered image is identical regardless of
+    # position/opacity/scale, giving zero gradient and a completely flat loss.
+    sh = torch.full((n, 3), 0.5, device=device)
     return GaussianCloud(
         means=means.to(device).detach().clone().requires_grad_(True),
         scales=log_scale.to(device).detach().clone().requires_grad_(True),
@@ -183,11 +186,15 @@ class StaticGSInit:
             opt, gamma=0.99)
 
         history: List[float] = []
+        # D-NeRF renders objects on a white background. The rasterizer defaults
+        # to black, so without an explicit bg_color the loss is dominated by the
+        # background mismatch and the cloud has no signal to learn the object.
+        bg = torch.ones(3, device=dev) if cfg.data.white_background else None
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
             for img, c2w, K in views:
-                out = render(cloud, c2w, K, width=W, height=H)
+                out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 loss = self.loss_fn(pred, tgt)

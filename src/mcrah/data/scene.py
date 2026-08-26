@@ -154,7 +154,12 @@ class DNeRFDataset(Dataset):
         self._intrinsics: Dict[str, torch.Tensor] = {}
         for c in cats:
             meta = load_scene_meta(cfg.data.data_root, c)
-            meta.intrinsics = intrinsics_from_fov(meta.camera_angle_x, self.W, self.H)
+            # Compute intrinsics at the RENDER resolution (render_wh), not the
+            # native image_wh. The differentiable rasterizer renders at
+            # render_wh to bound O(N*H*W) memory, so the projection must match
+            # that resolution or Gaussians project off-screen (rules.md Rule 6).
+            rW, rH = cfg.data.render_wh
+            meta.intrinsics = intrinsics_from_fov(meta.camera_angle_x, rW, rH)
             self.scenes[c] = meta
             self._intrinsics[c] = meta.intrinsics
             frames = meta.split_frames(split)
@@ -251,9 +256,10 @@ class ProcessedDNeRFDataset(Dataset):
             self._poses[c] = poses
             self._times[c] = times
             self._img_dir[c] = sp / "images"
-            # Intrinsics: recompute from camera_angle_x stored in a sidecar.
+            # Intrinsics: recompute from camera_angle_x at RENDER resolution.
             cax = float(np.load(Path(cfg.data.processed_root) / c / "camera_angle_x.npy"))
-            self._K[c] = intrinsics_from_fov(cax, self.W, self.H)
+            rW, rH = cfg.data.render_wh
+            self._K[c] = intrinsics_from_fov(cax, rW, rH)
             for i in range(len(poses)):
                 self.items.append((c, i))
 

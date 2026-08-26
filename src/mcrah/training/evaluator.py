@@ -98,8 +98,9 @@ class Evaluator:
             # to match so PSNR/SSIM are computed at a consistent scale.
             H = self.cfg.data.render_wh[1]
             W = self.cfg.data.render_wh[0]
+            bg = torch.ones(3, device=dev) if self.cfg.data.white_background else None
             out = render(step.cloud, s.c2w.to(dev), s.intrinsics.to(dev),
-                        width=W, height=H)
+                        width=W, height=H, bg_color=bg)
             pred = out.image.unsqueeze(0).clamp(0, 1)  # (1,3,H,W)
             tgt = s.image.to(dev).unsqueeze(0)         # (1,3,H0,W0)
             if tgt.shape[-2:] != (H, W):
