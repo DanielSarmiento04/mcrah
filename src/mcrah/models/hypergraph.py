@@ -232,7 +232,7 @@ def build_hypergraph_from_features(feats: torch.Tensor, k: Optional[int] = None,
     # k-means++ init
     first = int(torch.randint(0, n, (1,), generator=gen).item())
     centroids = [x[first].cpu()]
-    dist2 = torch.full((n,), float("inf"))
+    dist2 = torch.full((n,), float("inf"), device=device)
     for _ in range(1, k):
         c = centroids[-1].to(device)
         sim = x @ c

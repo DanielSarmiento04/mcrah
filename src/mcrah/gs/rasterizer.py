@@ -224,7 +224,14 @@ class PyTorchRasterizer(Rasterizer):
         # Accumulators. Out-of-place updates so autograd can flow from the
         # rendered image back through alpha, power, and conic to the Gaussian
         # means/rotations (essential for differentiable supervision).
-        rgb_acc = bg.view(3, 1, 1).expand(3, height, width).clone()
+        #
+        # rgb_acc starts at ZERO (not bg). The background is added at the end
+        # weighted by the remaining transmittance T_final:
+        #   C = Σ(aᵢ·Tᵢ·colorᵢ) + T_final · bg
+        # Starting rgb_acc at bg would compute C = bg + Σ(aᵢ·Tᵢ·colorᵢ), which
+        # overflows past 1.0 when bg is white (1.0) and gets clamped — zeroing
+        # all gradients (the flat-loss bug).
+        rgb_acc = torch.zeros(3, height, width, device=device, dtype=dtype)
         T = torch.ones(1, height, width, device=device, dtype=dtype)
         depth_acc = torch.zeros(1, height, width, device=device, dtype=dtype)
         n_visible = 0
@@ -290,6 +297,11 @@ class PyTorchRasterizer(Rasterizer):
             n_visible += 1
 
         alpha_acc = 1.0 - T  # accumulated opacity
+        # Background compositing: C = sum(a_i*T_i*color_i) + T_final * bg.
+        # The remaining transmittance T determines how much background shows
+        # through. Without this, pixels with no Gaussians stay black instead
+        # of showing the background.
+        rgb_acc = rgb_acc + T * bg.view(3, 1, 1)
         return RenderOutput(image=rgb_acc.clamp(0.0, 1.0), alpha=alpha_acc,
                             depth=depth_acc, n_visible=n_visible)
 

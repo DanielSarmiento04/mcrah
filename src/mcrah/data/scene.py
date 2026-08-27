@@ -188,13 +188,15 @@ class DNeRFDataset(Dataset):
 
     def _read_image(self, meta: SceneMeta, frame: dict) -> torch.Tensor:
         path = meta.root / (frame["file_path"] + ".png")
-        img = _read_png(path)
-        if img.shape[-1] == 4:
-            img = img[..., :3]  # drop alpha
+        img = _read_png(path)  # (H, W, 4) RGBA
         if img.shape[0] != self.H or img.shape[1] != self.W:
             # D-NeRF frames may already be (H,W); this path keeps PIL-free.
             img = _resize_nn(img, self.H, self.W)
-        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # (C,H,W)
+        # D-NeRF PNGs are RGBA. If white_background is set, composite the
+        # alpha channel onto white so the target matches the rasterizer's
+        # white bg.  The old code dropped alpha BEFORE the compositing check,
+        # making the white_background compositing dead code.
         if self.cfg.data.white_background and img.shape[0] == 4:
             alpha = img[3:4]
             img = img[:3] * alpha + (1.0 - alpha)

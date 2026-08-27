@@ -47,12 +47,17 @@ def seed_cloud_from_points(
     at ~0.1 (sigmoid(0) = 0.5 -> we use logit 0); rotations are identity.
     """
     n = means.shape[0]
-    # Estimate per-point scale from nearest-neighbor distance (cheap heuristic).
+    # Estimate per-point scale from the scene extent, not nearest-neighbor
+    # distance.  Using torch.cdist on N=50k points allocates an N x N matrix
+    # (~10 GB) and the resulting NN distances are so tiny that the splats
+    # are sub-pixel -- the rendered image is piecewise-constant w.r.t. means,
+    # giving zero gradient.  Instead use a fraction of the scene diagonal so
+    # each splat covers a few pixels and the rendering loss has gradient.
     if n > 1:
-        dists = torch.cdist(means, means)
-        dists.fill_diagonal_(float("inf"))
-        nn_d = dists.min(dim=-1).values.clamp_min(1e-3)
-        log_scale = torch.log(nn_d.mean().clamp_min(1e-2)).expand(n, 3).clone()
+        scene_diag = (means.max(dim=0).values - means.min(dim=0).values).norm()
+        scene_diag = scene_diag.clamp_min(1e-3)
+        splat_size = scene_diag / (n ** 0.5 + 1e-6)
+        log_scale = torch.full((n, 3), float(torch.log(splat_size)), device=device)
     else:
         log_scale = torch.full((n, 3), -2.0)
     # SH: 1 coefficient (DC) when degree 0. Initialize to a nonzero mid-gray
@@ -155,14 +160,24 @@ class StaticGSInit:
         if init_points is None:
             n = cfg.static_gs.num_gaussians
             cam = views[0][1]
-            fwd = cam[:3, 2]  # +Z in OpenCV
-            # spread points in a frustum in front of the first camera.
+            K0 = views[0][2]  # intrinsics at render resolution
+            fx, fy = K0[0, 0], K0[1, 1]
+            cx, cy = K0[0, 2], K0[1, 2]
+            # Spread points in a frustum in front of the first camera. The
+            # xy range must be scaled by z/fx so points project ON-SCREEN at
+            # the render resolution.  The old code used a fixed xy in [-1,1]
+            # which, at z=0.8 with fx~278, projected to u~442 -- far off the
+            # 200-px screen, so valid.sum()==0 and no Gaussian contributed.
             z = torch.linspace(0.8, 3.5, n // 4, device=dev)
             pts = []
             for zv in z:
                 m = n // 4
-                xy = (torch.rand(m, 2, device=dev) - 0.5) * 2.0
-                p = torch.cat([xy, zv.expand(m, 1)], dim=-1)
+                u_range = 0.8 * min(cx, cy)
+                u = (torch.rand(m, device=dev) - 0.5) * 2 * u_range
+                v = (torch.rand(m, device=dev) - 0.5) * 2 * u_range
+                x_cam = (u - cx) * zv / fx
+                y_cam = (v - cy) * zv / fy
+                p = torch.stack([x_cam, y_cam, zv.expand(m)], dim=-1)
                 pts.append(p @ cam[:3, :3].T + cam[:3, 3])
             init_points = torch.cat(pts, dim=0)
             if init_points.shape[0] > n:
