@@ -120,6 +120,11 @@ class TrainConfig:
     save_every: int = 5_000
     # Device
     device: str = "auto"  # "auto" | "cuda" | "mps" | "cpu"
+    # Hardware optimization
+    use_amp: bool = True       # automatic mixed precision on CUDA (no-op else)
+    # On CUDA with the official rasterizer, rendering at full 800x800 is fine;
+    # on the pure-torch fallback, keep render_wh low to bound O(N*H*W) memory.
+    cuda_render_wh: Tuple[int, int] = (800, 800)  # used only on CUDA backend
 
 
 @dataclass
@@ -146,3 +151,19 @@ class Config:
         if torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+    def auto_render_wh(self) -> Tuple[int, int]:
+        """Pick render resolution based on available hardware.
+
+        On CUDA with the official diff-gaussian-rasterization, full 800x800
+        is feasible.  On the pure-torch fallback (CPU/MPS or CUDA without
+        the package), keep the capped resolution to bound O(N*H*W) memory.
+        """
+        dev = self.device_str()
+        if dev == "cuda":
+            try:
+                import diff_gaussian_rasterization  # noqa: F401
+                return self.train.cuda_render_wh
+            except Exception:
+                pass
+        return self.data.render_wh

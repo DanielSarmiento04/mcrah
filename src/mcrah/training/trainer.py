@@ -98,6 +98,17 @@ class MCRAHTrainer:
 
         self._opt = self._build_optimizer()
 
+        # Automatic Mixed Precision (AMP) for GPU speedup.
+        # On CPU/MPS this is a no-op (enabled=False).
+        self._use_amp = bool(cfg.train.use_amp) and self.device == "cuda"
+        self._scaler = None
+        if self._use_amp:
+            try:
+                self._scaler = torch.amp.GradScaler("cuda")
+            except (TypeError, AttributeError):
+                # PyTorch < 2.4: GradScaler takes no device arg.
+                self._scaler = torch.cuda.amp.GradScaler()
+
     # ------------------------------------------------------------------ #
     # Optimization
     # ------------------------------------------------------------------ #
@@ -255,13 +266,31 @@ class MCRAHTrainer:
             return {"loss": 0.0}
 
         self._opt.zero_grad()
-        pred, target, deltas, steps = self._rollout_and_render(window)
-        loss, metrics = self._compute_loss(
-            pred, target, deltas, self.model.cloud, steps)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.cfg.train.grad_clip)
-        self._opt.step()
+
+        if self._use_amp:
+            try:
+                amp_ctx = torch.amp.autocast("cuda")
+            except (TypeError, AttributeError):
+                amp_ctx = torch.cuda.amp.autocast()
+            with amp_ctx:
+                pred, target, deltas, steps = self._rollout_and_render(window)
+                loss, metrics = self._compute_loss(
+                    pred, target, deltas, self.model.cloud, steps)
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self._opt)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.cfg.train.grad_clip)
+            self._scaler.step(self._opt)
+            self._scaler.update()
+        else:
+            pred, target, deltas, steps = self._rollout_and_render(window)
+            loss, metrics = self._compute_loss(
+                pred, target, deltas, self.model.cloud, steps)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.cfg.train.grad_clip)
+            self._opt.step()
+
         self.noise.step()
         self.state.step += 1
 

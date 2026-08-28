@@ -10,8 +10,10 @@ CUDA-only reference implementation.
 
 from .gaussian import GaussianCloud, transform_gaussians, apply_offsets
 from .rasterizer import (
-    render, set_rasterizer, Rasterizer, PyTorchRasterizer,
+    render, set_rasterizer, get_rasterizer,
+    Rasterizer, PyTorchRasterizer,
     CUDAGaussianRasterizer,
+    _cuda_rasterizer_available,
 )
 
 __all__ = [
@@ -20,6 +22,7 @@ __all__ = [
     "apply_offsets",
     "render",
     "set_rasterizer",
+    "get_rasterizer",
     "Rasterizer",
     "PyTorchRasterizer",
     "CUDAGaussianRasterizer",

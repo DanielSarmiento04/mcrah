@@ -148,7 +148,8 @@ class StaticGSInit:
 
         # Move views to device. Render at the capped supervision resolution
         # (cfg.data.render_wh) so the pure-torch rasterizer's O(N*H*W) memory
-        # stays bounded on Apple Silicon (rules.md Rule 6).
+        # stays bounded on Apple Silicon (rules.md Rule 6).  On CUDA with the
+        # official rasterizer, render_wh may be 800x800 (set by auto_render_wh).
         rH, rW = cfg.data.render_wh[1], cfg.data.render_wh[0]
         views = [
             (F.interpolate(img.unsqueeze(0), size=(rH, rW), mode="bilinear",

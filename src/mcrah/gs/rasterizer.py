@@ -367,7 +367,11 @@ class CUDAGaussianRasterizer(Rasterizer):
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(
                 "CUDAGaussianRasterizer requires the 'diff_gaussian_rasterization' "
-                "package on a CUDA device."
+                "package on a CUDA device.  Install it with:\n"
+                "  pip install git+https://github.com/graphdeco-inria/"
+                "diff-gaussian-rasterization\n"
+                "or fall back to the pure-torch rasterizer with "
+                "set_rasterizer('torch')."
             ) from e
 
         device = cloud.means.device
@@ -438,17 +442,33 @@ class CUDAGaussianRasterizer(Rasterizer):
 _RASTERIZER: Optional[Rasterizer] = None
 
 
+def _cuda_rasterizer_available() -> bool:
+    """Probe whether the diff_gaussian_rasterization package is importable
+    AND a CUDA device is present.  The package is a CUDA C++ extension
+    (not on PyPI) so it may be absent even on a CUDA machine."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import diff_gaussian_rasterization  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def set_rasterizer(rasterizer: Rasterizer | str | None = "auto") -> Rasterizer:
     """Install a backend. ``"auto"`` -> CUDA if available else pure-torch,
     ``"torch"`` -> pure-torch fallback, ``"cuda"`` -> CUDA adapter, or pass a
-    :class:`Rasterizer` instance directly."""
+    :class:`Rasterizer` instance directly.
+
+    ``"auto"`` probes for the *actual import* of
+    ``diff_gaussian_rasterization`` — not just ``torch.cuda.is_available()``
+    — so the system gracefully falls back to the pure-torch rasterizer when
+    the package is missing (common on Colab/free-tier GPU instances).
+    """
     global _RASTERIZER
     if rasterizer == "auto" or rasterizer is None:
-        if torch.cuda.is_available():
-            try:
-                _RASTERIZER = CUDAGaussianRasterizer()
-            except Exception:
-                _RASTERIZER = PyTorchRasterizer()
+        if _cuda_rasterizer_available():
+            _RASTERIZER = CUDAGaussianRasterizer()
         else:
             _RASTERIZER = PyTorchRasterizer()
     elif rasterizer == "torch":
