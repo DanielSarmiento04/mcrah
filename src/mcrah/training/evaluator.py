@@ -49,7 +49,7 @@ class Evaluator:
     def __init__(self, cfg: Config, device: Optional[str] = None):
         self.cfg = cfg
         self.device = device or cfg.device_str()
-        set_rasterizer("torch")
+        set_rasterizer("auto")
         self._lpips = None  # lazily loaded (optional dep)
 
     def _get_lpips(self):

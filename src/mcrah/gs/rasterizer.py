@@ -297,7 +297,7 @@ class PyTorchRasterizer(Rasterizer):
             n_visible += 1
 
         alpha_acc = 1.0 - T  # accumulated opacity
-        # Background compositing: C = sum(a_i*T_i*color_i) + T_final * bg.
+        # Background compositing: C = Σ(aᵢ·Tᵢ·colorᵢ) + T_final · bg.
         # The remaining transmittance T determines how much background shows
         # through. Without this, pixels with no Gaussians stay black instead
         # of showing the background.
@@ -314,10 +314,42 @@ class CUDAGaussianRasterizer(Rasterizer):
 
     Lazily imports the dependency so it remains optional. Used on cloud GPU
     nodes (agent.md: high-end cloud deployments) for production-speed training.
+
+    Bug fixes vs. the original prototype adapter:
+      * ``campos`` is now the *world-space* camera position (``c2w[:3,3]``),
+        not the w2c translation.
+      * Projection matrix uses the standard 3DGS ``getProjectionMatrix`` (FOV
+        based, not the ad-hoc 2*fx/W form).
+      * OpenCV→OpenGL convention conversion (flip y,z) so D-NeRF poses render
+        correctly through the OpenGL-assuming CUDA kernel.
+      * Matrices transposed for glm column-major, matching the official 3DGS
+        convention.
+      * ``projmatrix`` is passed at construction (``GaussianRasterizationSettings``
+        is a ``NamedTuple`` — post-construction assignment silently fails).
+      * ``scales``/``rotations`` passed as ``(N,3)``/``(N,4)`` (not unsqueezed
+        to ``(N,1,3)``/``(N,1,4)``).
     """
 
     def __init__(self, convert_to_cv: bool = True):
+        # If True, input c2w is OpenCV (x-right, y-down, z-forward) and we
+        # convert to OpenGL (x-right, y-up, z-back) for the CUDA kernel.
         self.convert_to_cv = convert_to_cv
+
+    @staticmethod
+    def _get_projection_matrix(
+        znear: float, zfar: float, fovx: float, fovy: float,
+        device: torch.device, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Standard 3DGS perspective projection matrix (OpenGL NDC [-1,1])."""
+        tanHalfFovX = math.tan(fovx / 2)
+        tanHalfFovY = math.tan(fovy / 2)
+        P = torch.zeros(4, 4, device=device, dtype=dtype)
+        P[0, 0] = 1.0 / tanHalfFovX
+        P[1, 1] = 1.0 / tanHalfFovY
+        P[3, 2] = 1.0
+        P[2, 2] = zfar / (zfar - znear)
+        P[2, 3] = zfar * znear / (znear - zfar)
+        return P
 
     def render(
         self,
@@ -339,56 +371,63 @@ class CUDAGaussianRasterizer(Rasterizer):
             ) from e
 
         device = cloud.means.device
+        dtype = cloud.means.dtype
         g = cloud.activated()
-        w2c = torch.inverse(c2w.to(device))  # camera-to-world -> world-to-camera
-        R = w2c[:3, :3].transpose(0, 1).contiguous()
-        t = w2c[:3, 3].contiguous()
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
 
-        bg = (bg_color if bg_color is not None else torch.zeros(3, device=device)
+        # World-to-camera from c2w (OpenCV convention: x-right, y-down, z-fwd).
+        w2c = torch.inverse(c2w.to(device=device, dtype=dtype))
+
+        # Convert OpenCV -> OpenGL (y-up, z-back) for the CUDA kernel.
+        # Equivalent to flipping columns 1,2 of c2w before inverting.
+        if self.convert_to_cv:
+            cv2gl = torch.diag(torch.tensor(
+                [1, -1, -1, 1], device=device, dtype=dtype))
+            w2c = cv2gl @ w2c
+
+        # Camera position in world space (= c2w translation, NOT w2c[:3,3]).
+        campos = c2w[:3, 3].to(device=device, dtype=dtype).contiguous()
+
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        fovx = 2.0 * math.atan(width / (2.0 * fx))
+        fovy = 2.0 * math.atan(height / (2.0 * fy))
+
+        bg = (bg_color if bg_color is not None
+              else torch.zeros(3, device=device, dtype=dtype)
               ).to(device).contiguous()
-        tanfovx = width / (2.0 * fx)
-        tanfovy = height / (2.0 * fy)
+
+        znear, zfar = 0.01, 100.0
+        P = self._get_projection_matrix(znear, zfar, fovx, fovy, device, dtype)
+
+        # Transpose for glm column-major (official 3DGS convention).
+        viewmatrix = w2c.transpose(0, 1).contiguous()
+        projmatrix = (P @ w2c).transpose(0, 1).contiguous()
 
         raster_settings = GaussianRasterizationSettings(
             image_height=height, image_width=width,
-            tanfovx=tanfovx, tanfovy=tanfovy,
+            tanfovx=math.tan(fovx / 2), tanfovy=math.tan(fovy / 2),
             bg=bg, scale_modifier=1.0,
-            viewmatrix=w2c.contiguous(), projmatrix=None,  # built below if needed
-            sh_degree=0, campos=w2c[:3, 3].contiguous(),
+            viewmatrix=viewmatrix, projmatrix=projmatrix,
+            sh_degree=0, campos=campos,
             prefiltered=False, debug=False,
         )
-        # NOTE: the official API expects a full projection matrix; assemble the
-        # standard perspective + view here. Kept minimal: callers using the CUDA
-        # backend are expected to pass a pre-built projmatrix via the cloud.
-        from math import tan  # local import to avoid global cost
-        near, far = 0.01, 100.0
-        P = torch.zeros(4, 4, device=device, dtype=g.means.dtype)
-        P[0, 0] = 2.0 * fx / width
-        P[1, 1] = 2.0 * fy / height
-        P[2, 2] = (far + near) / (far - near)
-        P[2, 3] = 2.0 * far * near / (far - near)
-        P[3, 2] = 1.0
-        raster_settings.projmatrix = (P @ w2c).contiguous()
 
         means3D = g.means.contiguous()
         means2D = torch.zeros_like(means3D)
         opacity = g.opacities.contiguous()
         shs = g.sh.view(g.n, 1, 3).contiguous()  # (N,1,3) DC term
-        scales = g.scales.contiguous()
-        rotations = g.rotations.contiguous()
+        scales = g.scales.contiguous()          # (N, 3) activated
+        rotations = g.rotations.contiguous()     # (N, 4) normalized
 
         raster = _CUDARas(raster_settings=raster_settings)
         img, radii = raster(
             means3D=means3D, means2D=means2D, shs=shs,
             colors_precomp=None, opacities=opacity,
-            scales=scales.unsqueeze(1).contiguous(),  # (N,1,3)
-            rotations=rotations.unsqueeze(1).contiguous(),  # (N,1,4)
+            scales=scales, rotations=rotations,
         )
         return RenderOutput(
-            image=img, alpha=torch.ones(1, height, width, device=device),
-            depth=torch.zeros(1, height, width, device=device),
+            image=img, alpha=torch.ones(1, height, width, device=device,
+                                        dtype=dtype),
+            depth=torch.zeros(1, height, width, device=device, dtype=dtype),
             n_visible=int((radii > 0).sum().item()),
         )
 
@@ -399,11 +438,20 @@ class CUDAGaussianRasterizer(Rasterizer):
 _RASTERIZER: Optional[Rasterizer] = None
 
 
-def set_rasterizer(rasterizer: Rasterizer | str | None = "torch") -> Rasterizer:
-    """Install a backend. ``"torch"`` -> pure-torch fallback, ``"cuda"`` -> CUDA
-    adapter, or pass a :class:`Rasterizer` instance directly."""
+def set_rasterizer(rasterizer: Rasterizer | str | None = "auto") -> Rasterizer:
+    """Install a backend. ``"auto"`` -> CUDA if available else pure-torch,
+    ``"torch"`` -> pure-torch fallback, ``"cuda"`` -> CUDA adapter, or pass a
+    :class:`Rasterizer` instance directly."""
     global _RASTERIZER
-    if rasterizer is None or rasterizer == "torch":
+    if rasterizer == "auto" or rasterizer is None:
+        if torch.cuda.is_available():
+            try:
+                _RASTERIZER = CUDAGaussianRasterizer()
+            except Exception:
+                _RASTERIZER = PyTorchRasterizer()
+        else:
+            _RASTERIZER = PyTorchRasterizer()
+    elif rasterizer == "torch":
         _RASTERIZER = PyTorchRasterizer()
     elif rasterizer == "cuda":
         _RASTERIZER = CUDAGaussianRasterizer()

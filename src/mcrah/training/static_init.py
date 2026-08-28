@@ -48,14 +48,16 @@ def seed_cloud_from_points(
     """
     n = means.shape[0]
     # Estimate per-point scale from the scene extent, not nearest-neighbor
-    # distance.  Using torch.cdist on N=50k points allocates an N x N matrix
+    # distance.  Using torch.cdist on N=50k points allocates an N×N matrix
     # (~10 GB) and the resulting NN distances are so tiny that the splats
-    # are sub-pixel -- the rendered image is piecewise-constant w.r.t. means,
+    # are sub-pixel — the rendered image is piecewise-constant w.r.t. means,
     # giving zero gradient.  Instead use a fraction of the scene diagonal so
     # each splat covers a few pixels and the rendering loss has gradient.
     if n > 1:
         scene_diag = (means.max(dim=0).values - means.min(dim=0).values).norm()
         scene_diag = scene_diag.clamp_min(1e-3)
+        # Each splat should be roughly scene_diag / sqrt(N) wide — small enough
+        # to be local, large enough to cover >1 pixel at the render resolution.
         splat_size = scene_diag / (n ** 0.5 + 1e-6)
         log_scale = torch.full((n, 3), float(torch.log(splat_size)), device=device)
     else:
@@ -125,7 +127,7 @@ class StaticGSInit:
     def __init__(self, cfg: Config, device: Optional[str] = None):
         self.cfg = cfg
         self.device = device or cfg.device_str()
-        set_rasterizer("torch")
+        set_rasterizer("auto")
         self.loss_fn = L1SSIMLoss(
             w_l1=cfg.train.w_l1, w_ssim=cfg.train.w_ssim)
 
@@ -165,13 +167,16 @@ class StaticGSInit:
             cx, cy = K0[0, 2], K0[1, 2]
             # Spread points in a frustum in front of the first camera. The
             # xy range must be scaled by z/fx so points project ON-SCREEN at
-            # the render resolution.  The old code used a fixed xy in [-1,1]
-            # which, at z=0.8 with fx~278, projected to u~442 -- far off the
+            # the render resolution.  The old code used a fixed xy∈[-1,1]
+            # which, at z=0.8 with fx≈278, projected to u≈442 — far off the
             # 200-px screen, so valid.sum()==0 and no Gaussian contributed.
-            z = torch.linspace(0.8, 3.5, n // 4, device=dev)
+            z_min, z_max = 0.8, 3.5
+            z = torch.linspace(z_min, z_max, n // 4, device=dev)
             pts = []
             for zv in z:
                 m = n // 4
+                # x in [-1,1] in pixel-normalized coords -> world via inverse
+                # projection: x_cam = (u - cx) * z / fx.  Use 80% of the FOV.
                 u_range = 0.8 * min(cx, cy)
                 u = (torch.rand(m, device=dev) - 0.5) * 2 * u_range
                 v = (torch.rand(m, device=dev) - 0.5) * 2 * u_range
