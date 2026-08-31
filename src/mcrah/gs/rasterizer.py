@@ -411,8 +411,10 @@ class CUDAGaussianRasterizer(Rasterizer):
             P = self._get_projection_matrix(znear, zfar, fovx, fovy, device, dtype)
 
             # Transpose for glm column-major (official 3DGS convention).
+            # In official 3DGS, full_proj_transform = world_view_transform @ projection_matrix
+            # where both world_view_transform (w2c^T) and projection_matrix (P^T) are column-major transposed.
             viewmatrix = w2c.transpose(0, 1).contiguous()
-            projmatrix = (P @ w2c).transpose(0, 1).contiguous()
+            projmatrix = (viewmatrix.unsqueeze(0).bmm(P.transpose(0, 1).unsqueeze(0))).squeeze(0).contiguous()
 
             raster_settings = GaussianRasterizationSettings(
                 image_height=height, image_width=width,

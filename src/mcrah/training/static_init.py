@@ -127,7 +127,10 @@ class StaticGSInit:
     def __init__(self, cfg: Config, device: Optional[str] = None):
         self.cfg = cfg
         self.device = device or cfg.device_str()
-        set_rasterizer("auto")
+        if self.device == "cpu":
+            set_rasterizer("torch")
+        else:
+            set_rasterizer("auto")
         self.loss_fn = L1SSIMLoss(
             w_l1=cfg.train.w_l1, w_ssim=cfg.train.w_ssim)
 

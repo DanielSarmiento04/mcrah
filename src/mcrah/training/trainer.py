@@ -74,7 +74,10 @@ class MCRAHTrainer:
         self.out_dir = Path(out_dir) if out_dir else Path("runs/default")
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        set_rasterizer("auto")
+        if self.device == "cpu":
+            set_rasterizer("torch")
+        else:
+            set_rasterizer("auto")
 
         # Build the model.
         self.model = MCRAH(cfg, cloud, hypergraph=hypergraph,
