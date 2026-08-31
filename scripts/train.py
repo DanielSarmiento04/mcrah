@@ -29,19 +29,26 @@ from mcrah.training import (
 )
 
 
-def load_t0_views(cfg: Config, category: str, device: str):
-    """Load the t=0 (first temporal step) training views for static init."""
+def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.15, min_views: int = 12):
+    """Load early / near t=0 training views for static 3DGS initialization.
+    
+    A single 2D view is mathematically ill-posed for 3D reconstruction and causes
+    3DGS to collapse into a flat 2D billboard. We gather multi-view cameras from
+    the earliest time frames (t <= max_t, minimum min_views) to reconstruct the
+    true 360-degree base geometry.
+    """
     ds = DNeRFDataset(cfg, split="train", categories=[category])
-    t0 = ds.temporal_steps(category)
-    if not t0:
-        raise RuntimeError(f"no temporal steps found for {category}")
-    idxs = [i for i, (c, _) in enumerate(ds.items)
-            if c == category and ds._time_indices[c][ds.items[i][1]] == t0[0]]
+    sorted_idxs = sorted(range(len(ds)), key=lambda i: ds[i].time)
+    selected = [i for i in sorted_idxs if ds[i].time <= max_t]
+    if len(selected) < min_views:
+        selected = sorted_idxs[:min(len(sorted_idxs), min_views)]
+
     views = []
-    for i in idxs:
+    for i in selected:
         s = ds[i]
         views.append((s.image, s.c2w, s.intrinsics))
-    print(f"[{category}] t=0 views: {len(views)}")
+    times = [ds[i].time for i in selected]
+    print(f"[{category}] static init: {len(views)} multi-view cameras (t in [{min(times):.3f}, {max(times):.3f}])")
     return views
 
 

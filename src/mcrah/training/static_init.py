@@ -159,34 +159,11 @@ class StaticGSInit:
         ]
         H, W = views[0][0].shape[-2], views[0][0].shape[-1]
 
-        # Seed points: if none provided, scatter uniformly in the scene volume
-        # in front of the camera.
+        # Seed points: if none provided, initialize Gaussians in the 3D volume
+        # centered at the world origin (0, 0, 0) where the D-NeRF object resides.
         if init_points is None:
             n = cfg.static_gs.num_gaussians
-            cam = views[0][1]
-            K0 = views[0][2]  # intrinsics at render resolution
-            fx, fy = K0[0, 0], K0[1, 1]
-            cx, cy = K0[0, 2], K0[1, 2]
-            cam_dist = float(cam[:3, 3].norm().item())
-            # In D-NeRF the object is at the origin; camera distance is ~4.0.
-            # Sample depths bracketing the object center.
-            z_min = max(0.5, cam_dist - 1.5)
-            z_max = cam_dist + 1.5
-            z = torch.linspace(z_min, z_max, max(1, n // 4), device=dev)
-            pts = []
-            for zv in z:
-                m = n // len(z)
-                # Sample pixel coords (u, v) centered around principal point (cx, cy)
-                u = cx + (torch.rand(m, device=dev) - 0.5) * 2 * (0.8 * cx)
-                v = cy + (torch.rand(m, device=dev) - 0.5) * 2 * (0.8 * cy)
-                x_cam = (u - cx) * zv / fx
-                y_cam = (v - cy) * zv / fy
-                p = torch.stack([x_cam, y_cam, zv.expand(m)], dim=-1)
-                pts.append(p @ cam[:3, :3].T + cam[:3, 3])
-            init_points = torch.cat(pts, dim=0)
-            if init_points.shape[0] > n:
-                init_points = init_points[torch.randperm(init_points.shape[0],
-                                                         device=dev)[:n]]
+            init_points = torch.randn(n, 3, device=dev) * 0.45
 
         cloud = seed_cloud_from_points(init_points, dev)
 

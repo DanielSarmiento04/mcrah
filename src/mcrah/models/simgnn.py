@@ -92,7 +92,7 @@ class OffsetHeads(nn.Module):
     identity delta is (1,0,0,0)."""
 
     def __init__(self, dim: int, predict_rotation: bool = True,
-                 pos_scale: float = 1e-2):
+                 pos_scale: float = 0.5):
         super().__init__()
         self.predict_rotation = predict_rotation
         self.pos_scale = pos_scale
