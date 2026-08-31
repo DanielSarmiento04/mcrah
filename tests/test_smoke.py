@@ -152,3 +152,43 @@ def test_pytorch_rasterizer_renders(tiny_cloud):
     assert out.alpha.shape == (1, 200, 200)
     assert out.image.min() >= 0.0 and out.image.max() <= 1.0
     assert out.n_visible > 0
+
+
+def test_cuda_rasterizer_promotes_half_precision_to_float32(monkeypatch):
+    """The official CUDA rasterizer expects float32 inputs even under AMP."""
+    import sys
+    import types
+
+    class DummyRasterizer:
+        def __init__(self, raster_settings):
+            self.settings = raster_settings
+
+        def __call__(self, *, means3D, means2D, shs, colors_precomp, opacities,
+                     scales, rotations):
+            assert means3D.dtype == torch.float32
+            assert means2D.dtype == torch.float32
+            assert shs.dtype == torch.float32
+            assert opacities.dtype == torch.float32
+            assert scales.dtype == torch.float32
+            assert rotations.dtype == torch.float32
+            return torch.zeros(3, 4, 4), torch.zeros(1, 1)
+
+    fake_module = types.SimpleNamespace(
+        GaussianRasterizationSettings=lambda **kwargs: kwargs,
+        GaussianRasterizer=DummyRasterizer,
+    )
+    monkeypatch.setitem(sys.modules, "diff_gaussian_rasterization", fake_module)
+
+    cloud = GaussianCloud(
+        means=torch.randn(8, 3, dtype=torch.float16),
+        scales=torch.full((8, 3), -2.0, dtype=torch.float16),
+        rotations=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float16).expand(8, 4),
+        opacities=torch.zeros(8, 1, dtype=torch.float16),
+        sh=torch.rand(8, 3, dtype=torch.float16),
+    )
+    c2w = torch.eye(4, dtype=torch.float16)
+    K = torch.tensor([[400.0, 0.0, 100.0], [0.0, 400.0, 100.0], [0.0, 0.0, 1.0]], dtype=torch.float16)
+
+    from mcrah.gs.rasterizer import CUDAGaussianRasterizer
+    out = CUDAGaussianRasterizer().render(cloud, c2w, K, width=4, height=4)
+    assert out.image.shape == (3, 4, 4)

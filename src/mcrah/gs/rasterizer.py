@@ -375,11 +375,24 @@ class CUDAGaussianRasterizer(Rasterizer):
             ) from e
 
         device = cloud.means.device
-        dtype = cloud.means.dtype
-        g = cloud.activated()
+        # The official diff-gaussian-rasterization CUDA kernel requires float32
+        # inputs. AMP/autocast may leave Gaussian means/opacities/scales in
+        # float16 on CUDA, which triggers the runtime error:
+        #   expected scalar type Float but found Half
+        # Cast the cloud + camera matrices to float32 before the kernel call.
+        dtype = torch.float32 if cloud.means.dtype in (torch.float16, torch.bfloat16) else cloud.means.dtype
+        g = GaussianCloud(
+            means=cloud.means.to(dtype=dtype),
+            scales=cloud.scales.to(dtype=dtype),
+            rotations=cloud.rotations.to(dtype=dtype),
+            opacities=cloud.opacities.to(dtype=dtype),
+            sh=cloud.sh.to(dtype=dtype),
+        ).activated()
 
         # World-to-camera from c2w (OpenCV convention: x-right, y-down, z-fwd).
-        w2c = torch.inverse(c2w.to(device=device, dtype=dtype))
+        c2w = c2w.to(device=device, dtype=dtype)
+        intrinsics = intrinsics.to(device=device, dtype=dtype)
+        w2c = torch.inverse(c2w)
 
         # Convert OpenCV -> OpenGL (y-up, z-back) for the CUDA kernel.
         # Equivalent to flipping columns 1,2 of c2w before inverting.
