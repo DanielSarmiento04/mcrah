@@ -309,6 +309,19 @@ class PyTorchRasterizer(Rasterizer):
 # --------------------------------------------------------------------------- #
 # Optional CUDA backend (diff-gaussian-rasterization)
 # --------------------------------------------------------------------------- #
+def _disable_autocast_ctx():
+    """Return a context manager that disables autocast across PyTorch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            return torch.amp.autocast("cuda", enabled=False)
+        except Exception:
+            pass
+    if hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
+        return torch.cuda.amp.autocast(enabled=False)
+    import contextlib
+    return contextlib.nullcontext()
+
+
 class CUDAGaussianRasterizer(Rasterizer):
     """Adapter around the official ``diff_gaussian_rasterization`` package.
 
@@ -328,6 +341,9 @@ class CUDAGaussianRasterizer(Rasterizer):
         is a ``NamedTuple`` — post-construction assignment silently fails).
       * ``scales``/``rotations`` passed as ``(N,3)``/``(N,4)`` (not unsqueezed
         to ``(N,1,3)``/``(N,1,4)``).
+      * Autocast is explicitly disabled during rasterization to guarantee all
+        tensors (inputs, projection matrices, intermediate activations) remain
+        float32 as required by the CUDA C++ kernel.
     """
 
     def __init__(self, convert_to_cv: bool = True):
@@ -374,79 +390,76 @@ class CUDAGaussianRasterizer(Rasterizer):
                 "set_rasterizer('torch')."
             ) from e
 
-        device = cloud.means.device
-        # The official diff-gaussian-rasterization CUDA kernel requires float32
-        # inputs. AMP/autocast may leave Gaussian means/opacities/scales in
-        # float16 on CUDA, which triggers the runtime error:
-        #   expected scalar type Float but found Half
-        # Cast the cloud + camera matrices to float32 before the kernel call.
-        dtype = torch.float32 if cloud.means.dtype in (torch.float16, torch.bfloat16) else cloud.means.dtype
-        g = GaussianCloud(
-            means=cloud.means.to(dtype=dtype),
-            scales=cloud.scales.to(dtype=dtype),
-            rotations=cloud.rotations.to(dtype=dtype),
-            opacities=cloud.opacities.to(dtype=dtype),
-            sh=cloud.sh.to(dtype=dtype),
-        ).activated()
+        with _disable_autocast_ctx():
+            device = cloud.means.device
+            dtype = torch.float32
 
-        # World-to-camera from c2w (OpenCV convention: x-right, y-down, z-fwd).
-        c2w = c2w.to(device=device, dtype=dtype)
-        intrinsics = intrinsics.to(device=device, dtype=dtype)
-        w2c = torch.inverse(c2w)
+            g = GaussianCloud(
+                means=cloud.means.to(device=device, dtype=dtype),
+                scales=cloud.scales.to(device=device, dtype=dtype),
+                rotations=cloud.rotations.to(device=device, dtype=dtype),
+                opacities=cloud.opacities.to(device=device, dtype=dtype),
+                sh=cloud.sh.to(device=device, dtype=dtype),
+            ).activated()
 
-        # Convert OpenCV -> OpenGL (y-up, z-back) for the CUDA kernel.
-        # Equivalent to flipping columns 1,2 of c2w before inverting.
-        if self.convert_to_cv:
-            cv2gl = torch.diag(torch.tensor(
-                [1, -1, -1, 1], device=device, dtype=dtype))
-            w2c = cv2gl @ w2c
+            # World-to-camera from c2w (OpenCV convention: x-right, y-down, z-fwd).
+            c2w_f = c2w.to(device=device, dtype=dtype)
+            intrinsics_f = intrinsics.to(device=device, dtype=dtype)
+            w2c = torch.inverse(c2w_f)
 
-        # Camera position in world space (= c2w translation, NOT w2c[:3,3]).
-        campos = c2w[:3, 3].to(device=device, dtype=dtype).contiguous()
+            # Convert OpenCV -> OpenGL (y-up, z-back) for the CUDA kernel.
+            # Equivalent to flipping columns 1,2 of c2w before inverting.
+            if self.convert_to_cv:
+                cv2gl = torch.diag(torch.tensor(
+                    [1.0, -1.0, -1.0, 1.0], device=device, dtype=dtype))
+                w2c = cv2gl @ w2c
 
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        fovx = 2.0 * math.atan(width / (2.0 * fx))
-        fovy = 2.0 * math.atan(height / (2.0 * fy))
+            # Camera position in world space (= c2w translation, NOT w2c[:3,3]).
+            campos = c2w_f[:3, 3].contiguous()
 
-        bg = (bg_color if bg_color is not None
-              else torch.zeros(3, device=device, dtype=dtype)
-              ).to(device).contiguous()
+            fx, fy = float(intrinsics_f[0, 0].item()), float(intrinsics_f[1, 1].item())
+            fovx = 2.0 * math.atan(width / (2.0 * fx))
+            fovy = 2.0 * math.atan(height / (2.0 * fy))
 
-        znear, zfar = 0.01, 100.0
-        P = self._get_projection_matrix(znear, zfar, fovx, fovy, device, dtype)
+            bg = (bg_color.to(device=device, dtype=dtype) if bg_color is not None
+                  else torch.zeros(3, device=device, dtype=dtype)
+                  ).contiguous()
 
-        # Transpose for glm column-major (official 3DGS convention).
-        viewmatrix = w2c.transpose(0, 1).contiguous()
-        projmatrix = (P @ w2c).transpose(0, 1).contiguous()
+            znear, zfar = 0.01, 100.0
+            P = self._get_projection_matrix(znear, zfar, fovx, fovy, device, dtype)
 
-        raster_settings = GaussianRasterizationSettings(
-            image_height=height, image_width=width,
-            tanfovx=math.tan(fovx / 2), tanfovy=math.tan(fovy / 2),
-            bg=bg, scale_modifier=1.0,
-            viewmatrix=viewmatrix, projmatrix=projmatrix,
-            sh_degree=0, campos=campos,
-            prefiltered=False, debug=False,
-        )
+            # Transpose for glm column-major (official 3DGS convention).
+            viewmatrix = w2c.transpose(0, 1).contiguous()
+            projmatrix = (P @ w2c).transpose(0, 1).contiguous()
 
-        means3D = g.means.contiguous()
-        means2D = torch.zeros_like(means3D)
-        opacity = g.opacities.contiguous()
-        shs = g.sh.view(g.n, 1, 3).contiguous()  # (N,1,3) DC term
-        scales = g.scales.contiguous()          # (N, 3) activated
-        rotations = g.rotations.contiguous()     # (N, 4) normalized
+            raster_settings = GaussianRasterizationSettings(
+                image_height=height, image_width=width,
+                tanfovx=math.tan(fovx / 2), tanfovy=math.tan(fovy / 2),
+                bg=bg, scale_modifier=1.0,
+                viewmatrix=viewmatrix, projmatrix=projmatrix,
+                sh_degree=0, campos=campos,
+                prefiltered=False, debug=False,
+            )
 
-        raster = _CUDARas(raster_settings=raster_settings)
-        img, radii = raster(
-            means3D=means3D, means2D=means2D, shs=shs,
-            colors_precomp=None, opacities=opacity,
-            scales=scales, rotations=rotations,
-        )
-        return RenderOutput(
-            image=img, alpha=torch.ones(1, height, width, device=device,
-                                        dtype=dtype),
-            depth=torch.zeros(1, height, width, device=device, dtype=dtype),
-            n_visible=int((radii > 0).sum().item()),
-        )
+            means3D = g.means.contiguous().float()
+            means2D = torch.zeros_like(means3D, dtype=torch.float32)
+            opacity = g.opacities.contiguous().float()
+            shs = g.sh.view(g.n, 1, 3).contiguous().float()  # (N,1,3) DC term
+            scales = g.scales.contiguous().float()          # (N, 3) activated
+            rotations = g.rotations.contiguous().float()     # (N, 4) normalized
+
+            raster = _CUDARas(raster_settings=raster_settings)
+            img, radii = raster(
+                means3D=means3D, means2D=means2D, shs=shs,
+                colors_precomp=None, opacities=opacity,
+                scales=scales, rotations=rotations,
+            )
+            return RenderOutput(
+                image=img, alpha=torch.ones(1, height, width, device=device,
+                                            dtype=dtype),
+                depth=torch.zeros(1, height, width, device=device, dtype=dtype),
+                n_visible=int((radii > 0).sum().item()),
+            )
 
 
 # --------------------------------------------------------------------------- #
