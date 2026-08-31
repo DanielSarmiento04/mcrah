@@ -328,27 +328,11 @@ class CUDAGaussianRasterizer(Rasterizer):
     Lazily imports the dependency so it remains optional. Used on cloud GPU
     nodes (agent.md: high-end cloud deployments) for production-speed training.
 
-    Bug fixes vs. the original prototype adapter:
-      * ``campos`` is now the *world-space* camera position (``c2w[:3,3]``),
-        not the w2c translation.
-      * Projection matrix uses the standard 3DGS ``getProjectionMatrix`` (FOV
-        based, not the ad-hoc 2*fx/W form).
-      * OpenCV→OpenGL convention conversion (flip y,z) so D-NeRF poses render
-        correctly through the OpenGL-assuming CUDA kernel.
-      * Matrices transposed for glm column-major, matching the official 3DGS
-        convention.
-      * ``projmatrix`` is passed at construction (``GaussianRasterizationSettings``
-        is a ``NamedTuple`` — post-construction assignment silently fails).
-      * ``scales``/``rotations`` passed as ``(N,3)``/``(N,4)`` (not unsqueezed
-        to ``(N,1,3)``/``(N,1,4)``).
-      * Autocast is explicitly disabled during rasterization to guarantee all
-        tensors (inputs, projection matrices, intermediate activations) remain
-        float32 as required by the CUDA C++ kernel.
+    Maintains standard 3DGS OpenCV convention (x-right, y-down, z-forward) with
+    the perspective projection matrix matching the CUDA kernel's expected +Z.
     """
 
-    def __init__(self, convert_to_cv: bool = True):
-        # If True, input c2w is OpenCV (x-right, y-down, z-forward) and we
-        # convert to OpenGL (x-right, y-up, z-back) for the CUDA kernel.
+    def __init__(self, convert_to_cv: bool = False):
         self.convert_to_cv = convert_to_cv
 
     @staticmethod
@@ -364,7 +348,7 @@ class CUDAGaussianRasterizer(Rasterizer):
         P[1, 1] = 1.0 / tanHalfFovY
         P[3, 2] = 1.0
         P[2, 2] = zfar / (zfar - znear)
-        P[2, 3] = zfar * znear / (znear - zfar)
+        P[2, 3] = -(zfar * znear) / (zfar - znear)
         return P
 
     def render(
@@ -407,8 +391,6 @@ class CUDAGaussianRasterizer(Rasterizer):
             intrinsics_f = intrinsics.to(device=device, dtype=dtype)
             w2c = torch.inverse(c2w_f)
 
-            # Convert OpenCV -> OpenGL (y-up, z-back) for the CUDA kernel.
-            # Equivalent to flipping columns 1,2 of c2w before inverting.
             if self.convert_to_cv:
                 cv2gl = torch.diag(torch.tensor(
                     [1.0, -1.0, -1.0, 1.0], device=device, dtype=dtype))
@@ -444,14 +426,14 @@ class CUDAGaussianRasterizer(Rasterizer):
             means3D = g.means.contiguous().float()
             means2D = torch.zeros_like(means3D, dtype=torch.float32)
             opacity = g.opacities.contiguous().float()
-            shs = g.sh.view(g.n, 1, 3).contiguous().float()  # (N,1,3) DC term
+            colors = g.sh.contiguous().float()              # (N,3) DC RGB
             scales = g.scales.contiguous().float()          # (N, 3) activated
             rotations = g.rotations.contiguous().float()     # (N, 4) normalized
 
             raster = _CUDARas(raster_settings=raster_settings)
             img, radii = raster(
-                means3D=means3D, means2D=means2D, shs=shs,
-                colors_precomp=None, opacities=opacity,
+                means3D=means3D, means2D=means2D, shs=None,
+                colors_precomp=colors, opacities=opacity,
                 scales=scales, rotations=rotations,
             )
             return RenderOutput(

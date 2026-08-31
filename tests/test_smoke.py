@@ -167,7 +167,10 @@ def test_cuda_rasterizer_promotes_half_precision_to_float32(monkeypatch):
                      scales, rotations):
             assert means3D.dtype == torch.float32
             assert means2D.dtype == torch.float32
-            assert shs.dtype == torch.float32
+            if shs is not None:
+                assert shs.dtype == torch.float32
+            if colors_precomp is not None:
+                assert colors_precomp.dtype == torch.float32
             assert opacities.dtype == torch.float32
             assert scales.dtype == torch.float32
             assert rotations.dtype == torch.float32
