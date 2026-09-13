@@ -129,7 +129,8 @@ def run_category(cfg: Config, category: str, args) -> dict:
                   "lpips": metrics.lpips_mean if metrics else None}
             if metrics else None,
         "rollout_final_drift": final_drift,
-        "rollout_steps": stability.steps,
+        "rollout_steps": len(stability.steps),
+        "rollout_step_indices": stability.steps,
         "rollout_pos_drift": stability.pos_drift,
     }
     with open(out_dir / "results.json", "w") as f:
