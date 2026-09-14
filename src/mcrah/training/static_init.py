@@ -162,13 +162,23 @@ class StaticGSInit:
         ]
         H, W = views[0][0].shape[-2], views[0][0].shape[-1]
 
-        # Seed points: if none provided, initialize Gaussians in the 3D volume
-        # centered at the world origin (0, 0, 0) where the D-NeRF object resides.
+        # Seed points: if none provided, initialize Gaussians in a tight 3D volume
+        # centered at the origin (0, 0, 0) where the D-NeRF object resides.
         if init_points is None:
             n = cfg.static_gs.num_gaussians
-            init_points = torch.randn(n, 3, device=dev) * 0.45
+            # Tighten seed radius to 0.35 to keep initial Gaussians inside the object volume
+            init_points = torch.randn(n, 3, device=dev) * 0.35
 
         cloud = seed_cloud_from_points(init_points, dev)
+
+        # Initialize SH colors to match mean image foreground color if available
+        with torch.no_grad():
+            mean_color = torch.mean(views[0][0], dim=(-2, -1))  # (3,)
+            cloud.sh.data.copy_(mean_color.unsqueeze(0).expand(cloud.n, 3))
+            # Start opacities at logit -1.0 (sigmoid = 0.27) to avoid massive initial overlap
+            cloud.opacities.data.fill_(-1.0)
+            # Bound log-scales between -6.0 (exp = 0.0025) and -2.8 (exp = 0.06)
+            cloud.scales.data.clamp_(-6.0, -2.8)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         params = [
@@ -202,10 +212,29 @@ class StaticGSInit:
             total.backward()
             opt.step()
             sched.step()
+
+            # Keep parameters physically bounded during optimization
+            with torch.no_grad():
+                cloud.scales.data.clamp_(-6.0, -2.8)
+                cloud.sh.data.clamp_(0.0, 1.0)
+                cloud.opacities.data.clamp_(-4.0, 4.0)
+
             history.append(float(total.item()))
             if (it + 1) % max(1, iters // 10) == 0:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
                       f"loss={total.item():.5f}")
+
+        # Prune dead/transparent floaters (opacity logit < -2.9 -> opacity < 0.05)
+        with torch.no_grad():
+            valid_mask = (cloud.opacities.squeeze(-1) > -2.9)
+            if valid_mask.sum() > 100:  # Ensure we retain enough points
+                cloud = GaussianCloud(
+                    means=cloud.means[valid_mask],
+                    scales=cloud.scales[valid_mask],
+                    rotations=cloud.rotations[valid_mask],
+                    opacities=cloud.opacities[valid_mask],
+                    sh=cloud.sh[valid_mask],
+                )
 
         # Detach the final substrate; MCRAH does not train it.
         final = GaussianCloud(
