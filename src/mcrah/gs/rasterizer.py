@@ -433,15 +433,30 @@ class CUDAGaussianRasterizer(Rasterizer):
             rotations = g.rotations.contiguous().float()     # (N, 4) normalized
 
             raster = _CUDARas(raster_settings=raster_settings)
-            img, radii = raster(
+            res = raster(
                 means3D=means3D, means2D=means2D, shs=None,
                 colors_precomp=colors, opacities=opacity,
                 scales=scales, rotations=rotations,
             )
+
+            if isinstance(res, (tuple, list)):
+                img = res[0]
+                radii = res[1]
+                if len(res) >= 3 and isinstance(res[2], torch.Tensor):
+                    depth = res[2]
+                    if depth.ndim == 2:
+                        depth = depth.unsqueeze(0)
+                else:
+                    depth = torch.zeros(1, height, width, device=device, dtype=dtype)
+            else:
+                img = res
+                radii = torch.zeros(means3D.shape[0], device=device, dtype=torch.int32)
+                depth = torch.zeros(1, height, width, device=device, dtype=dtype)
+
             return RenderOutput(
-                image=img, alpha=torch.ones(1, height, width, device=device,
-                                            dtype=dtype),
-                depth=torch.zeros(1, height, width, device=device, dtype=dtype),
+                image=img,
+                alpha=torch.ones(1, height, width, device=device, dtype=dtype),
+                depth=depth,
                 n_visible=int((radii > 0).sum().item()),
             )
 
