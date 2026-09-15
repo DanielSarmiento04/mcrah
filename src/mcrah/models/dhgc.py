@@ -62,10 +62,11 @@ class DilatedAttention(nn.Module):
 
         # (N,H,1,Dh) x (N,H,Dh,max_deg) -> (N,H,1,max_deg)
         attn = torch.einsum("nhd,nmhd->nhm", q, k) * self.scale
-        # Mask padding neighbors with -inf.
-        neg = torch.finfo(attn.dtype).min
+        # Mask padding neighbors with float16-safe large negative value.
+        neg = -1e4 if attn.dtype in (torch.float16, torch.bfloat16) else -1e9
         attn = attn.masked_fill(~mask.unsqueeze(1), neg)
         attn = attn.softmax(dim=-1)                         # (N,H,1,max_deg)
+        attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.drop(attn)
 
         # Weighted sum: (N,H,1,max_deg) x (N,H,max_deg,Dh) -> (N,H,Dh)

@@ -106,20 +106,18 @@ class MCRAHGate(nn.Module):
         cluster_feat = self.cluster_enc(
             torch.cat([cluster_disp, centroid_0], dim=-1)) # (E, D)
 
-        # Compatibility: dot product (N, E).
-        logits = node_feat @ cluster_feat.t() / self.tau   # (N, E)
+        # Compatibility: dot product (N, E) performed in float32 for AMP stability.
+        logits = (node_feat.float() @ cluster_feat.float().t()) / max(1e-4, float(self.tau))
 
         # Prior bias: strong logit for the initial assignment, negative for others.
-        # Initialized high so the model starts close to the static hypergraph
-        # and gradually learns to deviate where motion demands it. Kept
-        # differentiable so prior_logit can be learned end-to-end.
         mask_0 = F.one_hot(
             assignment_0.clamp_min(0).clamp_max(E - 1), num_classes=E
-        ).to(logits.dtype)                                   # (N, E)
-        prior = self.prior_logit * (2.0 * mask_0 - 1.0)     # +pl assigned, -pl else
+        ).float()                                            # (N, E)
+        prior = self.prior_logit.float() * (2.0 * mask_0 - 1.0)     # +pl assigned, -pl else
         logits = logits + prior
 
-        return logits.softmax(dim=-1)                       # (N, E)
+        res = logits.softmax(dim=-1).to(node_feat.dtype)    # (N, E)
+        return torch.nan_to_num(res, nan=1.0 / E)
 
 
 # --------------------------------------------------------------------------- #

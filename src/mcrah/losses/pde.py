@@ -34,8 +34,9 @@ class RelativeL2Loss(nn.Module):
         if delta.shape != state.shape:
             state = state.expand_as(delta)
         num = (delta ** 2).sum(dim=-1, keepdim=True)
-        den = (state ** 2).sum(dim=-1, keepdim=True) + self.eps
-        return (num / den).mean()
+        den = ((state ** 2).sum(dim=-1, keepdim=True) + self.eps).clamp_min(1e-5)
+        res = (num / den).mean()
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class NoiseInjector(nn.Module):
