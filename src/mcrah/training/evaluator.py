@@ -137,7 +137,7 @@ class Evaluator:
         self,
         model: MCRAH,
         n_steps: int = 100,
-        dt: float = 0.05,
+        dt: float = 0.01,
     ) -> RolloutStability:
         """Long-horizon rollout without ground truth (Step 11).
 
