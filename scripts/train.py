@@ -89,15 +89,17 @@ def run_category(cfg: Config, category: str, args) -> dict:
     iters = args.iterations
     for stage in stages:
         print(f"\n[{category}] training stage: {stage} ({iters} iters)")
-        trainer.set_stage(stage)
+        trainer.set_stage(stage, total_steps=iters)
         for it in range(iters):
             # Sample a random mini-batch of frames.
             idx = torch.randint(0, len(samples), (cfg.train.batch_views,))
             batch = [samples[i] for i in idx]
             m = trainer.train_step(batch)
             if (it + 1) % max(1, iters // 5) == 0:
+                lp_str = f"  lpips={m['lpips']:.4f}" if m.get("lpips", 0.0) > 0.0 else ""
+                lr_str = f"  lr={m['lr']:.6f}" if "lr" in m else ""
                 print(f"  it {it+1}/{iters}  loss={m['loss']:.5f}  "
-                      f"photo={m['photo']:.5f}  rel_l2={m['rel_l2']:.5f}")
+                      f"photo={m['photo']:.5f}{lr_str}{lp_str}  rel_l2={m['rel_l2']:.5f}")
         trainer.save(tag=stage)
 
     # ---- Phase 4: evaluation ----------------------------------------- #

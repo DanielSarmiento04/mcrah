@@ -97,10 +97,10 @@ class Evaluator:
             t = torch.tensor(window[0].time, device=dev)
             step = model.step(model.cloud, t)
             s = window[0]
-            # Render at the capped supervision resolution; resample the target
-            # to match so PSNR/SSIM are computed at a consistent scale.
-            H = self.cfg.data.render_wh[1]
-            W = self.cfg.data.render_wh[0]
+            # Render at hardware-adaptive resolution (auto_render_wh() on CUDA); resample
+            # target to match so PSNR/SSIM/LPIPS are computed at a consistent scale.
+            render_wh = self.cfg.auto_render_wh() if dev == "cuda" else self.cfg.data.render_wh
+            H, W = render_wh[1], render_wh[0]
             bg = torch.ones(3, device=dev) if self.cfg.data.white_background else None
             out = render(step.cloud, s.c2w.to(dev), s.intrinsics.to(dev),
                         width=W, height=H, bg_color=bg)

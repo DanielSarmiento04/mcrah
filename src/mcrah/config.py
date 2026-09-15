@@ -82,11 +82,16 @@ class ModelConfig:
     num_heads: int = 8
     num_simgnn_layers: int = 4
     num_dhgc_layers: int = 2
-    # Gaussian attribute prediction heads
+    # Fourier positional encoding frequencies (coordinates & time)
+    num_freqs_pos: int = 6           # L_pos: 3D coordinates -> 3 + 6*6 = 39 dims
+    num_freqs_time: int = 4          # L_time: time -> 1 + 2*4 = 9 dims
+    # Gaussian attribute prediction heads & motion damping
     predict_offset: bool = True       # Delta position
     predict_rotation: bool = True     # Delta rotation (as quaternion delta)
     predict_scale: bool = False
     predict_sh: bool = False
+    pos_scale: float = 0.20           # Max displacement scale in OffsetHeads (calibrated from 0.5)
+    motion_damping: float = 0.95     # Residual motion damping factor
     # Noise injection (rules.md Rule 4 / agent.md directive 4)
     noise_std: float = 1e-2
     noise_warmup_steps: int = 2_000
@@ -108,13 +113,19 @@ class TrainConfig:
     iterations: int = 100_000
     lr: float = 1e-3
     lr_decay: float = 0.98
+    # Stage-specific initial learning rates
+    lr_dense: float = 1e-3
+    lr_farfield: float = 5e-4
+    lr_joint: float = 2e-4
+    lr_min: float = 1e-6
+    use_cosine_scheduler: bool = True
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
     # Loss weights
     w_l1: float = 0.8
     w_ssim: float = 0.2
     w_rel_l2: float = 0.05
-    w_lpips: float = 0.0  # enabled in Phase 4
+    w_lpips: float = 0.05  # perceptual loss weight (activated in joint stage)
     # Eval
     eval_every: int = 2_000
     save_every: int = 5_000

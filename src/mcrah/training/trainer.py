@@ -96,10 +96,10 @@ class MCRAHTrainer:
         self.rigidity_loss = RigidityLoss()
         self.topo_loss = TopologySmoothnessLoss()
 
+        self._lpips_module = None
+        self._scheduler = None
         self.state = TrainState(stage=cfg.train.stage)
-        self.model.configure_stage(cfg.train.stage)
-
-        self._opt = self._build_optimizer()
+        self.set_stage(cfg.train.stage)
 
         # Automatic Mixed Precision (AMP) for GPU speedup.
         # On CPU/MPS this is a no-op (enabled=False).
@@ -113,28 +113,68 @@ class MCRAHTrainer:
                 self._scaler = torch.cuda.amp.GradScaler()
 
     # ------------------------------------------------------------------ #
-    # Optimization
+    # Perceptual Loss
     # ------------------------------------------------------------------ #
-    def _build_optimizer(self) -> torch.optim.Optimizer:
-        """Adam with separate LRs for the two stages (decoupled training)."""
+    def _get_lpips(self):
+        """Lazily initialize frozen LPIPS AlexNet evaluator/loss module."""
+        if self._lpips_module is None:
+            try:
+                import warnings
+                import lpips
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    net = lpips.LPIPS(net="alex").to(self.device)
+                    net.eval()
+                    for p in net.parameters():
+                        p.requires_grad = False
+                    self._lpips_module = net
+            except Exception:
+                self._lpips_module = False
+        return self._lpips_module if self._lpips_module is not False else None
+
+    # ------------------------------------------------------------------ #
+    # Optimization & Stage Control
+    # ------------------------------------------------------------------ #
+    def _build_optimizer(self, stage: Optional[str] = None) -> torch.optim.Optimizer:
+        """AdamW with stage-specific initial learning rates (decoupled training)."""
         cfg = self.cfg
+        stg = stage or self.state.stage
+        if stg == "dense":
+            lr = getattr(cfg.train, "lr_dense", cfg.train.lr)
+        elif stg == "farfield":
+            lr = getattr(cfg.train, "lr_farfield", cfg.train.lr)
+        elif stg == "joint":
+            lr = getattr(cfg.train, "lr_joint", cfg.train.lr)
+        else:
+            lr = cfg.train.lr
+
         params = [p for p in self.model.parameters() if p.requires_grad]
         if not params:
             # Avoid empty-param error in edge cases (e.g. eval-only).
             params = [torch.zeros(1, requires_grad=True, device=self.device)]
         return torch.optim.AdamW(
-            params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+            params, lr=lr, weight_decay=cfg.train.weight_decay)
 
-    def set_stage(self, stage: str) -> None:
-        """Switch the decoupled training stage and rebuild the optimizer."""
+    def set_stage(self, stage: str, total_steps: Optional[int] = None) -> None:
+        """Switch the decoupled training stage and rebuild the optimizer and scheduler."""
         if stage not in ("dense", "farfield", "joint"):
             raise ValueError(f"unknown stage: {stage}")
         self.model.configure_stage(stage)
         self.state.stage = stage
-        self._opt = self._build_optimizer()
+        self._opt = self._build_optimizer(stage)
+        if getattr(self.cfg.train, "use_cosine_scheduler", True):
+            steps = total_steps or self.cfg.train.iterations
+            lr_min = getattr(self.cfg.train, "lr_min", 1e-6)
+            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self._opt, T_max=max(1, steps), eta_min=lr_min
+            )
+        else:
+            self._scheduler = None
+
+        lr_curr = self._opt.param_groups[0]["lr"]
         print(f"[trainer] stage -> {stage} "
               f"({sum(p.numel() for p in self.model.parameters() if p.requires_grad)} "
-              f"trainable params)")
+              f"trainable params, lr={lr_curr:.6f})")
 
     # ------------------------------------------------------------------ #
     # Rollout + rendering
@@ -166,13 +206,12 @@ class MCRAHTrainer:
 
         Returns: (pred_images, target_images, deltas, steps)
 
-        Renders at ``cfg.data.render_wh`` to bound the pure-torch rasterizer's
-        O(N*H*W) autograd memory (rules.md Rule 6). Targets are resampled to the
-        same resolution so the photometric loss stays well-posed.
+        Renders at hardware-adaptive resolution (auto_render_wh() on CUDA)
+        to maximize visual fidelity while bounding pure-torch O(N*H*W) memory on CPU/MPS.
         """
         dev = self.device
-        H = self.cfg.data.render_wh[1]
-        W = self.cfg.data.render_wh[0]
+        render_wh = self.cfg.auto_render_wh() if dev == "cuda" else self.cfg.data.render_wh
+        H, W = render_wh[1], render_wh[0]
         bg = torch.ones(3, device=dev) if self.cfg.data.white_background else None
         times = [torch.tensor(s.time, device=dev) for s in window]
         steps = self.model.rollout(times, noise_injector=self.noise)
@@ -203,10 +242,11 @@ class MCRAHTrainer:
         cloud: GaussianCloud,
         steps: Optional[List] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Combined loss: L1+SSIM + relative-L2 + PDE smoothness + MCRAH.
+        """Combined loss: L1+SSIM + relative-L2 + PDE smoothness + MCRAH + perceptual LPIPS.
 
         The MCRAH rigidity + topology-smoothness losses are only active when the
         model has the adaptive hypergraph (cfg.hypergraph.adaptive=True).
+        Perceptual LPIPS loss is enabled during the 'joint' fine-tuning stage.
         """
         cfg = self.cfg
         # Photometric: pred/target are (T,3,H,W); the loss treats T as batch.
@@ -245,12 +285,24 @@ class MCRAHTrainer:
                         self.topo_loss(memberships[i], memberships[i - 1])
                         for i in range(1, len(memberships))) / (len(memberships) - 1)
 
+        # Perceptual LPIPS loss (active during joint fine-tuning stage)
+        lp_loss = pred.new_zeros(())
+        w_lpips = getattr(cfg.train, "w_lpips", 0.0)
+        if self.state.stage == "joint" and w_lpips > 0.0:
+            lpips_fn = self._get_lpips()
+            if lpips_fn is not None:
+                p_norm = (pred * 2.0 - 1.0).clamp(-1.0, 1.0).float()
+                t_norm = (target * 2.0 - 1.0).clamp(-1.0, 1.0).float()
+                lp_loss = lpips_fn(p_norm, t_norm).mean()
+
         loss = (photo + cfg.train.w_rel_l2 * rel + pde
                 + mc.rigidity_weight * rig
-                + mc.topology_smoothness_weight * topo)
+                + mc.topology_smoothness_weight * topo
+                + w_lpips * lp_loss)
         metrics = {
             "loss": float(loss.item()),
             "photo": float(photo.item()),
+            "lpips": float(lp_loss.item()),
             "rel_l2": float(rel.item()),
             "pde": float(pde.item()),
             "rigidity": float(rig.item()),
@@ -295,6 +347,9 @@ class MCRAHTrainer:
             self._opt.step()
 
         self.noise.step()
+        if self._scheduler is not None:
+            self._scheduler.step()
+        metrics["lr"] = float(self._opt.param_groups[0]["lr"])
         self.state.step += 1
 
         if metrics["loss"] < self.state.best_loss:
@@ -318,12 +373,15 @@ class MCRAHTrainer:
     # ------------------------------------------------------------------ #
     def save(self, tag: str = "latest") -> Path:
         path = self.out_dir / f"checkpoint_{tag}.pt"
-        torch.save({
+        payload = {
             "model": self.model.state_dict(),
             "optimizer": self._opt.state_dict(),
             "state": self.state.__dict__,
             "cfg": self.cfg.__dict__,
-        }, path)
+        }
+        if self._scheduler is not None:
+            payload["scheduler"] = self._scheduler.state_dict()
+        torch.save(payload, path)
         return path
 
     def load(self, path: str | Path) -> None:
@@ -331,4 +389,8 @@ class MCRAHTrainer:
                           weights_only=False)
         self.model.load_state_dict(ckpt["model"])
         self.state.__dict__.update(ckpt["state"])
-        self.model.configure_stage(self.state.stage)
+        self.set_stage(self.state.stage)
+        if "optimizer" in ckpt:
+            self._opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt and self._scheduler is not None:
+            self._scheduler.load_state_dict(ckpt["scheduler"])

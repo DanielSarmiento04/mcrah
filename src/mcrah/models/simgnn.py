@@ -16,6 +16,7 @@ Design:
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -23,17 +24,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class FourierEmbedding(nn.Module):
+    """Multi-frequency sinusoidal positional encoding.
+
+    Maps input tensor of shape (..., in_dim) to (..., out_dim) where
+    out_dim = in_dim * (1 + 2 * num_freqs) if include_input else in_dim * 2 * num_freqs.
+    Frequencies are exponentially spaced: 2^0, 2^1, ..., 2^(num_freqs - 1).
+    """
+
+    def __init__(self, in_dim: int, num_freqs: int, include_input: bool = True):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_freqs = num_freqs
+        self.include_input = include_input
+        if num_freqs > 0:
+            freq_bands = 2.0 ** torch.arange(num_freqs, dtype=torch.float32) * math.pi
+            self.register_buffer("freq_bands", freq_bands, persistent=False)
+        else:
+            self.freq_bands = None
+
+    @property
+    def out_dim(self) -> int:
+        base = self.in_dim if self.include_input else 0
+        return base + self.in_dim * 2 * self.num_freqs
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_freqs <= 0 or self.freq_bands is None:
+            return x
+        # x: (..., in_dim)
+        xb = x.unsqueeze(-1) * self.freq_bands.to(device=x.device, dtype=x.dtype)
+        sin_part = torch.sin(xb).flatten(-2)
+        cos_part = torch.cos(xb).flatten(-2)
+        parts = [x] if self.include_input else []
+        parts.extend([sin_part, cos_part])
+        return torch.cat(parts, dim=-1)
+
+
 class FeatureEncoder(nn.Module):
-    """Encodes raw Gaussian attributes into the model feature space."""
+    """Encodes raw Gaussian attributes into the model feature space with
+    multi-frequency Fourier positional encodings for coordinate & temporal inputs."""
 
     def __init__(self, feat_dim: int = 64, n_clusters: int = 256,
-                 n_time_bins: int = 64):
+                 n_time_bins: int = 64, num_freqs_pos: int = 6,
+                 num_freqs_time: int = 4):
         super().__init__()
         self.feat_dim = feat_dim
-        self.proj = nn.Linear(3 + 3 + 3 + 1, feat_dim)  # pos(3)+scale(3)+sh(3)+op(1)
+        self.pos_encoder = FourierEmbedding(in_dim=3, num_freqs=num_freqs_pos, include_input=True)
+        self.time_encoder = FourierEmbedding(in_dim=1, num_freqs=num_freqs_time, include_input=True)
+
+        raw_dim = self.pos_encoder.out_dim + 3 + 3 + 1  # pos(39) + scale(3) + sh(3) + op(1)
+        self.proj = nn.Linear(raw_dim, feat_dim)
         self.cluster_emb = nn.Embedding(n_clusters + 1, feat_dim)
         self.time_mlp = nn.Sequential(
-            nn.Linear(1, feat_dim), nn.SiLU(), nn.Linear(feat_dim, feat_dim)
+            nn.Linear(self.time_encoder.out_dim, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, feat_dim),
         )
 
     def forward(self, cloud, cluster_id: torch.Tensor, time: torch.Tensor
@@ -43,12 +88,16 @@ class FeatureEncoder(nn.Module):
             time = time.expand(cloud.means.shape[0], 1)
         elif time.dim() == 1:
             time = time.view(-1, 1)
+
+        pos_feat = self.pos_encoder(cloud.means)
+        time_feat = self.time_encoder(time.to(cloud.means.dtype))
+
         op = cloud.opacities[:, :1]
-        raw = torch.cat([cloud.means, cloud.scales, cloud.sh, op], dim=-1)
+        raw = torch.cat([pos_feat, cloud.scales, cloud.sh, op], dim=-1)
         h = self.proj(raw)
         cid = cluster_id.clamp_min(0)
         h = h + self.cluster_emb(cid)
-        h = h + self.time_mlp(time.to(h.dtype))
+        h = h + self.time_mlp(time_feat)
         return h
 
 
@@ -89,18 +138,32 @@ class OffsetHeads(nn.Module):
     """Predicts Δposition (N,3) and Δrotation (N,4 quaternion delta).
 
     Rotations are predicted as small perturbations and normalized; the
-    identity delta is (1,0,0,0)."""
+    identity delta is (1,0,0,0). Includes residual motion damping to prevent
+    skeletal scatter and high-frequency drift across dynamic frames."""
 
     def __init__(self, dim: int, predict_rotation: bool = True,
-                 pos_scale: float = 0.5):
+                 pos_scale: float = 0.20, motion_damping: float = 0.95):
         super().__init__()
         self.predict_rotation = predict_rotation
         self.pos_scale = pos_scale
+        self.motion_damping = motion_damping
         self.pos_head = nn.Sequential(
             nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 3)
         )
         nn.init.normal_(self.pos_head[-1].weight, std=1e-4)
         nn.init.zeros_(self.pos_head[-1].bias)
+
+        # Residual motion damping head: modulates velocity/offset magnitude
+        self.damp_head = nn.Sequential(
+            nn.Linear(dim, max(16, dim // 2)), nn.SiLU(),
+            nn.Linear(max(16, dim // 2), 1), nn.Sigmoid()
+        )
+        nn.init.zeros_(self.damp_head[-2].weight)
+        # Initialize damping bias so sigmoid(init_bias) ~ motion_damping
+        damp_clamped = min(0.999, max(0.001, motion_damping))
+        init_bias = math.log(damp_clamped / (1.0 - damp_clamped))
+        nn.init.constant_(self.damp_head[-2].bias, init_bias)
+
         if predict_rotation:
             # Predict a 3D axis-angle-like perturbation, convert to quaternion.
             self.rot_head = nn.Sequential(
@@ -110,9 +173,10 @@ class OffsetHeads(nn.Module):
             nn.init.zeros_(self.rot_head[-1].bias)
 
     def forward(self, h: torch.Tensor):
-        delta_pos = self.pos_scale * torch.tanh(self.pos_head(h))
+        damp = self.damp_head(h)  # (N, 1) in (0, 1)
+        delta_pos = (self.pos_scale * torch.tanh(self.pos_head(h))) * damp
         if self.predict_rotation:
-            rotvec = self.rot_head(h)
+            rotvec = self.rot_head(h) * damp
             delta_rot = axis_angle_to_quaternion(rotvec)
         else:
             delta_rot = None
@@ -146,8 +210,14 @@ class SIMGNN(nn.Module):
         super().__init__()
         self.cfg = cfg
         d = cfg.model.feat_dim
+        num_pos = getattr(cfg.model, "num_freqs_pos", 6)
+        num_time = getattr(cfg.model, "num_freqs_time", 4)
+        pos_scale = getattr(cfg.model, "pos_scale", 0.20)
+        damping = getattr(cfg.model, "motion_damping", 0.95)
+
         self.encoder = FeatureEncoder(
             feat_dim=d, n_clusters=max(256, 2 * int(d)),
+            num_freqs_pos=num_pos, num_freqs_time=num_time,
         )
         self.blocks = nn.ModuleList([
             HGNNBlock(d, dropout=cfg.model.dropout)
@@ -155,7 +225,8 @@ class SIMGNN(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d)
         self.heads = OffsetHeads(
-            d, predict_rotation=cfg.model.predict_rotation
+            d, predict_rotation=cfg.model.predict_rotation,
+            pos_scale=pos_scale, motion_damping=damping,
         )
 
     def encode(self, cloud, hypergraph, cluster_id: torch.Tensor,
