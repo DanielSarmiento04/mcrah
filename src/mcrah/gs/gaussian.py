@@ -65,7 +65,7 @@ class GaussianCloud:
     def activated(self) -> "GaussianCloud":
         return GaussianCloud(
             means=self.means,
-            scales=torch.exp(self.scales).clamp_max(0.036),
+            scales=torch.exp(self.scales).clamp_max(0.06),
             rotations=quaternion_normalize(self.rotations),
             opacities=torch.sigmoid(self.opacities),
             sh=torch.clamp(self.sh, 0.0, 1.0),

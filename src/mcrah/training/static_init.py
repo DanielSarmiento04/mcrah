@@ -118,60 +118,79 @@ def seed_cloud_from_views(
     views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     n_gaussians: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Seed 3D points and initial RGB colors from multi-view foreground rays.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Seed 3D points inside the 3D visual hull of the object centered at (0,0,0).
 
-    Returns (points (N,3), colors (N,3)).
+    Generates candidate 3D points in [-0.45, 0.45]^3 world space, projects them into
+    all t=0 camera views, and selects points that project to foreground pixels across
+    multiple views with initial colors sampled from projected 2D RGB pixels.
+
+    Returns (points (N,3), colors (N,3), initial_opacities (N,1)).
     """
-    pts_list = []
-    colors_list = []
+    # 1. Generate candidate points in world space [-0.45, 0.45]^3 around origin
+    n_candidates = max(n_gaussians * 3, 100_000)
+    candidates = (torch.rand(n_candidates, 3, device=device) - 0.5) * 0.9  # [-0.45, 0.45]^3
 
+    accum_color = torch.zeros(n_candidates, 3, device=device)
+    hit_count = torch.zeros(n_candidates, device=device)
+
+    # 2. Project candidates into each camera view
     for img, c2w, K in views:
-        # Foreground mask: pixels noticeably darker/different from white background [1, 1, 1]
-        is_fg = (img < 0.92).any(dim=0)  # (H, W)
-        ys, xs = torch.where(is_fg)
-        if len(xs) < 10:
-            continue
+        H, W = img.shape[-2], img.shape[-1]
+        w2c = torch.inverse(c2w)
+
+        R_w2c = w2c[:3, :3]
+        t_w2c = w2c[:3, 3]
+        pts_cam = candidates @ R_w2c.T + t_w2c  # (N, 3)
+
+        z = pts_cam[:, 2]
+        in_front = z > 0.1
 
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
 
-        n_samples = min(len(xs), max(500, n_gaussians // len(views)))
-        idx = torch.randperm(len(xs), device=device)[:n_samples]
-        sub_x = xs[idx].float()
-        sub_y = ys[idx].float()
-        colors = img[:, ys[idx], xs[idx]].t()  # (S, 3)
+        u = (fx * pts_cam[:, 0] / z + cx).round().long()
+        v = (fy * pts_cam[:, 1] / z + cy).round().long()
 
-        # Depth range for D-NeRF objects in camera space (OpenCV +Z forward)
-        z = torch.empty(n_samples, device=device).uniform_(1.8, 3.2)
-        x_cam = (sub_x - cx) * z / fx
-        y_cam = (sub_y - cy) * z / fy
-        pts_cam = torch.stack([x_cam, y_cam, z], dim=-1)  # (S, 3)
+        in_bounds = in_front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
 
-        # Transform to world space
-        R = c2w[:3, :3]
-        t = c2w[:3, 3]
-        pts_world = pts_cam @ R.T + t  # (S, 3)
+        if not in_bounds.any():
+            continue
 
-        pts_list.append(pts_world)
-        colors_list.append(colors)
+        valid_idx = torch.where(in_bounds)[0]
+        u_v = u[valid_idx]
+        v_v = v[valid_idx]
 
-    if pts_list:
-        all_pts = torch.cat(pts_list, dim=0)
-        all_colors = torch.cat(colors_list, dim=0)
-        if all_pts.shape[0] < n_gaussians:
-            repeat_cnt = (n_gaussians // all_pts.shape[0]) + 1
-            all_pts = all_pts.repeat(repeat_cnt, 1)[:n_gaussians] + torch.randn(n_gaussians, 3, device=device) * 0.02
-            all_colors = all_colors.repeat(repeat_cnt, 1)[:n_gaussians]
+        pix_colors = img[:, v_v, u_v].t()  # (M, 3)
+        is_fg = (pix_colors < 0.92).any(dim=-1)  # (M,) bool
+
+        fg_valid_idx = valid_idx[is_fg]
+        fg_pix_colors = pix_colors[is_fg]
+
+        accum_color.index_add_(0, fg_valid_idx, fg_pix_colors)
+        hit_count.index_add_(0, fg_valid_idx, torch.ones_like(fg_valid_idx, dtype=torch.float))
+
+    # 3. Select points inside visual hull (hit_count > 0)
+    fg_mask = hit_count > 0
+    if fg_mask.sum() > 100:
+        hull_idx = torch.where(fg_mask)[0]
+        sorted_idx = hull_idx[torch.argsort(hit_count[hull_idx], descending=True)]
+
+        if len(sorted_idx) >= n_gaussians:
+            sel_idx = sorted_idx[:n_gaussians]
         else:
-            perm = torch.randperm(all_pts.shape[0], device=device)[:n_gaussians]
-            all_pts = all_pts[perm]
-            all_colors = all_colors[perm]
-        return all_pts, all_colors
+            repeat_cnt = (n_gaussians // len(sorted_idx)) + 1
+            sel_idx = sorted_idx.repeat(repeat_cnt)[:n_gaussians]
+
+        selected_pts = candidates[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.005
+        selected_colors = accum_color[sel_idx] / hit_count[sel_idx].unsqueeze(-1).clamp_min(1.0)
+        selected_opacities = torch.full((n_gaussians, 1), 0.5, device=device)
+        return selected_pts, selected_colors, selected_opacities
     else:
         pts = torch.randn(n_gaussians, 3, device=device) * 0.35
         colors = torch.full((n_gaussians, 3), 0.3, device=device)
-        return pts, colors
+        opacities = torch.zeros(n_gaussians, 1, device=device)
+        return pts, colors, opacities
 
 
 class StaticGSInit:
@@ -203,7 +222,7 @@ class StaticGSInit:
         """Fit a static cloud to ``views`` = list of (image, c2w, intrinsics).
 
         ``init_points``: optional (M,3) seed points; if None, points are
-        seeded from multi-view foreground rays.
+        seeded via 3D visual hull projection.
         """
         cfg = self.cfg
         iters = iterations or cfg.static_gs.iterations
@@ -219,24 +238,25 @@ class StaticGSInit:
         ]
         H, W = views[0][0].shape[-2], views[0][0].shape[-1]
 
-        # Seed points & colors from multi-view foreground rays
+        # Seed points & colors from 3D visual hull projection
         if init_points is None:
             n = cfg.static_gs.num_gaussians
-            init_points, init_colors = seed_cloud_from_views(views, n, dev)
+            init_points, init_colors, init_opacities = seed_cloud_from_views(views, n, dev)
         else:
             init_colors = None
+            init_opacities = None
 
         cloud = seed_cloud_from_points(init_points, dev)
 
-        # Initialize SH colors and scales
+        # Initialize SH colors, opacities, and scales
         with torch.no_grad():
             if init_colors is not None:
                 cloud.sh.data.copy_(init_colors)
+            if init_opacities is not None:
+                cloud.opacities.data.copy_(init_opacities)
             else:
-                mean_color = torch.mean(views[0][0], dim=(-2, -1))
-                cloud.sh.data.copy_(mean_color.unsqueeze(0).expand(cloud.n, 3))
-            cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-6.0, -3.3)
+                cloud.opacities.data.fill_(-0.5)
+            cloud.scales.data.clamp_(-6.0, -2.8)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         params = [
@@ -270,7 +290,7 @@ class StaticGSInit:
 
             # Keep parameters physically bounded during optimization
             with torch.no_grad():
-                cloud.scales.data.clamp_(-6.0, -3.3)
+                cloud.scales.data.clamp_(-6.0, -2.8)
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-3.5, 4.0)
 
@@ -279,10 +299,10 @@ class StaticGSInit:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
                       f"loss={total.item():.5f}")
 
-        # Prune dead/transparent floaters (opacity logit < -2.9 -> opacity < 0.05)
+        # Conservative opacity pruning (opacity logit < -3.5 -> opacity < 0.029)
         with torch.no_grad():
-            valid_mask = (cloud.opacities.squeeze(-1) > -2.9)
-            if valid_mask.sum() > 100:  # Ensure we retain enough points
+            valid_mask = (cloud.opacities.squeeze(-1) > -3.5)
+            if valid_mask.sum() > 500:  # Retain active visual hull cloud
                 cloud = GaussianCloud(
                     means=cloud.means[valid_mask],
                     scales=cloud.scales[valid_mask],
