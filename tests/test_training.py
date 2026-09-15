@@ -108,7 +108,7 @@ def test_rasterizer_is_differentiable():
     gcloud = GaussianCloud(
         means=means, scales=cloud.scales, rotations=cloud.rotations,
         opacities=cloud.opacities, sh=cloud.sh)
-    K = torch.tensor([[400.0, 0.0, 100.0], [0.0, 400.0, 100.0],
+    K = torch.tensor([[32.0, 0.0, 16.0], [0.0, 32.0, 16.0],
                       [0.0, 0.0, 1.0]])
     c2w = torch.eye(4); c2w[2, 3] = -4.0
     out = render(gcloud, c2w, K, width=32, height=32)

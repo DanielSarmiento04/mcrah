@@ -256,7 +256,7 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-6.0, -2.8)
+            cloud.scales.data.clamp_(-6.0, -3.8)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         params = [
@@ -290,7 +290,7 @@ class StaticGSInit:
 
             # Keep parameters physically bounded during optimization
             with torch.no_grad():
-                cloud.scales.data.clamp_(-6.0, -2.8)
+                cloud.scales.data.clamp_(-6.0, -3.8)
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-3.5, 4.0)
 
