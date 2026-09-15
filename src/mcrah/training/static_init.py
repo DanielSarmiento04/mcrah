@@ -114,6 +114,66 @@ def points_from_depth(
     return pts_cam @ R.T + t  # (S,3) world
 
 
+def seed_cloud_from_views(
+    views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    n_gaussians: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Seed 3D points and initial RGB colors from multi-view foreground rays.
+
+    Returns (points (N,3), colors (N,3)).
+    """
+    pts_list = []
+    colors_list = []
+
+    for img, c2w, K in views:
+        # Foreground mask: pixels noticeably darker/different from white background [1, 1, 1]
+        is_fg = (img < 0.92).any(dim=0)  # (H, W)
+        ys, xs = torch.where(is_fg)
+        if len(xs) < 10:
+            continue
+
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        n_samples = min(len(xs), max(500, n_gaussians // len(views)))
+        idx = torch.randperm(len(xs), device=device)[:n_samples]
+        sub_x = xs[idx].float()
+        sub_y = ys[idx].float()
+        colors = img[:, ys[idx], xs[idx]].t()  # (S, 3)
+
+        # Depth range for D-NeRF objects in camera space (OpenCV +Z forward)
+        z = torch.empty(n_samples, device=device).uniform_(1.8, 3.2)
+        x_cam = (sub_x - cx) * z / fx
+        y_cam = (sub_y - cy) * z / fy
+        pts_cam = torch.stack([x_cam, y_cam, z], dim=-1)  # (S, 3)
+
+        # Transform to world space
+        R = c2w[:3, :3]
+        t = c2w[:3, 3]
+        pts_world = pts_cam @ R.T + t  # (S, 3)
+
+        pts_list.append(pts_world)
+        colors_list.append(colors)
+
+    if pts_list:
+        all_pts = torch.cat(pts_list, dim=0)
+        all_colors = torch.cat(colors_list, dim=0)
+        if all_pts.shape[0] < n_gaussians:
+            repeat_cnt = (n_gaussians // all_pts.shape[0]) + 1
+            all_pts = all_pts.repeat(repeat_cnt, 1)[:n_gaussians] + torch.randn(n_gaussians, 3, device=device) * 0.02
+            all_colors = all_colors.repeat(repeat_cnt, 1)[:n_gaussians]
+        else:
+            perm = torch.randperm(all_pts.shape[0], device=device)[:n_gaussians]
+            all_pts = all_pts[perm]
+            all_colors = all_colors[perm]
+        return all_pts, all_colors
+    else:
+        pts = torch.randn(n_gaussians, 3, device=device) * 0.35
+        colors = torch.full((n_gaussians, 3), 0.3, device=device)
+        return pts, colors
+
+
 class StaticGSInit:
     """Optimize a static Gaussian cloud against t=0 cameras.
 
@@ -143,16 +203,13 @@ class StaticGSInit:
         """Fit a static cloud to ``views`` = list of (image, c2w, intrinsics).
 
         ``init_points``: optional (M,3) seed points; if None, points are
-        seeded from the first view's depth (heuristic uniform sampling).
+        seeded from multi-view foreground rays.
         """
         cfg = self.cfg
         iters = iterations or cfg.static_gs.iterations
         dev = self.device
 
-        # Move views to device. Render at the capped supervision resolution
-        # (cfg.data.render_wh) so the pure-torch rasterizer's O(N*H*W) memory
-        # stays bounded on Apple Silicon (rules.md Rule 6).  On CUDA with the
-        # official rasterizer, render_wh may be 800x800 (set by auto_render_wh).
+        # Move views to device.
         rH, rW = cfg.data.render_wh[1], cfg.data.render_wh[0]
         views = [
             (F.interpolate(img.unsqueeze(0), size=(rH, rW), mode="bilinear",
@@ -162,42 +219,40 @@ class StaticGSInit:
         ]
         H, W = views[0][0].shape[-2], views[0][0].shape[-1]
 
-        # Seed points: if none provided, initialize Gaussians in a tight 3D volume
-        # centered at the origin (0, 0, 0) where the D-NeRF object resides.
+        # Seed points & colors from multi-view foreground rays
         if init_points is None:
             n = cfg.static_gs.num_gaussians
-            # Tighten seed radius to 0.35 to keep initial Gaussians inside the object volume
-            init_points = torch.randn(n, 3, device=dev) * 0.35
+            init_points, init_colors = seed_cloud_from_views(views, n, dev)
+        else:
+            init_colors = None
 
         cloud = seed_cloud_from_points(init_points, dev)
 
-        # Initialize SH colors to match mean image foreground color if available
+        # Initialize SH colors and scales
         with torch.no_grad():
-            mean_color = torch.mean(views[0][0], dim=(-2, -1))  # (3,)
-            cloud.sh.data.copy_(mean_color.unsqueeze(0).expand(cloud.n, 3))
-            # Start opacities at logit -1.0 (sigmoid = 0.27) to avoid massive initial overlap
-            cloud.opacities.data.fill_(-1.0)
-            # Bound log-scales between -6.0 (exp = 0.0025) and -2.8 (exp = 0.06)
-            cloud.scales.data.clamp_(-6.0, -2.8)
+            if init_colors is not None:
+                cloud.sh.data.copy_(init_colors)
+            else:
+                mean_color = torch.mean(views[0][0], dim=(-2, -1))
+                cloud.sh.data.copy_(mean_color.unsqueeze(0).expand(cloud.n, 3))
+            cloud.opacities.data.fill_(-0.5)
+            cloud.scales.data.clamp_(-6.0, -3.3)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         params = [
-            {"params": [cloud.means], "lr": cfg.static_gs.lr_means},
+            {"params": [cloud.means], "lr": cfg.static_gs.lr_means * 1.5},
             {"params": [cloud.scales], "lr": cfg.static_gs.lr_scales},
             {"params": [cloud.opacities], "lr": cfg.static_gs.lr_opacity},
-            {"params": [cloud.sh], "lr": cfg.static_gs.lr_sh},
+            {"params": [cloud.sh], "lr": 3.5e-3},
         ]
         if cfg.model.predict_rotation:
             params.append(
                 {"params": [cloud.rotations], "lr": cfg.static_gs.lr_means})
         opt = torch.optim.Adam(params, lr=cfg.static_gs.lr_means)
         sched = torch.optim.lr_scheduler.ExponentialLR(
-            opt, gamma=0.99)
+            opt, gamma=0.992)
 
         history: List[float] = []
-        # D-NeRF renders objects on a white background. The rasterizer defaults
-        # to black, so without an explicit bg_color the loss is dominated by the
-        # background mismatch and the cloud has no signal to learn the object.
         bg = torch.ones(3, device=dev) if cfg.data.white_background else None
         for it in range(iters):
             opt.zero_grad()
@@ -215,9 +270,9 @@ class StaticGSInit:
 
             # Keep parameters physically bounded during optimization
             with torch.no_grad():
-                cloud.scales.data.clamp_(-6.0, -2.8)
+                cloud.scales.data.clamp_(-6.0, -3.3)
                 cloud.sh.data.clamp_(0.0, 1.0)
-                cloud.opacities.data.clamp_(-4.0, 4.0)
+                cloud.opacities.data.clamp_(-3.5, 4.0)
 
             history.append(float(total.item()))
             if (it + 1) % max(1, iters // 10) == 0:
