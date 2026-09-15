@@ -54,7 +54,9 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.15, 
 
 def run_category(cfg: Config, category: str, args) -> dict:
     device = cfg.device_str()
-    print(f"\n{'='*60}\n[{category}] device={device}\n{'='*60}")
+    if args.render_wh is None:
+        cfg.data.render_wh = cfg.auto_render_wh()
+    print(f"\n{'='*60}\n[{category}] device={device} render_wh={cfg.data.render_wh}\n{'='*60}")
 
     out_dir = Path(args.out) / category
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -146,7 +148,7 @@ def main():
     p.add_argument("--out", default="./runs", help="output directory")
     p.add_argument("--iterations", type=int, default=1000,
                    help="training iterations per stage")
-    p.add_argument("--static-iters", type=int, default=500,
+    p.add_argument("--static-iters", type=int, default=1500,
                    help="static 3DGS init iterations")
     p.add_argument("--num-gaussians", type=int, default=None,
                    help="static 3DGS cloud size (default: cfg). The pure-torch "

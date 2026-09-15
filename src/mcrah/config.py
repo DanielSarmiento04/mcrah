@@ -70,7 +70,7 @@ class HypergraphConfig:
 @dataclass
 class MCRAHLossConfig:
     """Loss weights for the MCRAH novel-module regularizers."""
-    rigidity_weight: float = 1e-2    # quasi-rigid-body prior
+    rigidity_weight: float = 0.05    # quasi-rigid-body prior
     topology_smoothness_weight: float = 1e-3  # temporal membership stability
 
 
@@ -113,7 +113,7 @@ class TrainConfig:
     # Loss weights
     w_l1: float = 0.8
     w_ssim: float = 0.2
-    w_rel_l2: float = 1e-3
+    w_rel_l2: float = 0.05
     w_lpips: float = 0.0  # enabled in Phase 4
     # Eval
     eval_every: int = 2_000
