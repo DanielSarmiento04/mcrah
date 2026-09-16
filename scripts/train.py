@@ -186,6 +186,8 @@ def main():
         args.max_samples = 16
         args.max_eval = 8
         args.rollout_steps = 10
+        if args.num_gaussians is None:
+            args.num_gaussians = 2000
 
     cfg = Config()
     # Apply CLI memory overrides (the pure-torch rasterizer is O(N*H*W) in

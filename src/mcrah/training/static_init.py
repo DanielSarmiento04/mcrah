@@ -289,6 +289,7 @@ class StaticGSInit:
 
         history: List[float] = []
         bg = torch.ones(3, device=dev) if cfg.data.white_background else None
+        n_views = max(1, len(views))
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
@@ -297,9 +298,9 @@ class StaticGSInit:
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 loss = self.loss_fn(pred, tgt)
-                total = total + loss
-            total = total / len(views)
-            total.backward()
+                (loss / n_views).backward()
+                total = total + float(loss.item())
+            total = total / n_views
             opt.step()
             sched.step()
 
