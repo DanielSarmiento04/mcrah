@@ -310,10 +310,10 @@ class StaticGSInit:
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-3.5, 4.0)
 
-            history.append(float(total.item()))
+            history.append(float(total))
             if (it + 1) % max(1, iters // 10) == 0:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
-                      f"loss={total.item():.5f}")
+                      f"loss={total:.5f}")
 
         # Conservative opacity pruning (opacity logit < -3.5 -> opacity < 0.029)
         with torch.no_grad():
