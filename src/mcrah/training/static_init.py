@@ -15,6 +15,7 @@ a production run would substitute the full CUDA 3DGS optimization here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -228,8 +229,9 @@ class StaticGSInit:
         iters = iterations or cfg.static_gs.iterations
         dev = self.device
 
-        # Move views to device.
-        rH, rW = cfg.data.render_wh[1], cfg.data.render_wh[0]
+        # Move views to device using hardware-adaptive resolution.
+        render_wh = cfg.auto_render_wh() if dev == "cuda" else cfg.data.render_wh
+        rH, rW = render_wh[1], render_wh[0]
         views = [
             (F.interpolate(img.unsqueeze(0), size=(rH, rW), mode="bilinear",
                            align_corners=False).squeeze(0).to(dev),
@@ -256,21 +258,34 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-6.0, -3.8)
+            cloud.scales.data.clamp_(-7.0, -3.2)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
+        lr_means_init = cfg.static_gs.lr_means * 1.5
         params = [
-            {"params": [cloud.means], "lr": cfg.static_gs.lr_means * 1.5},
+            {"params": [cloud.means], "lr": lr_means_init},
             {"params": [cloud.scales], "lr": cfg.static_gs.lr_scales},
             {"params": [cloud.opacities], "lr": cfg.static_gs.lr_opacity},
             {"params": [cloud.sh], "lr": 3.5e-3},
         ]
         if cfg.model.predict_rotation:
             params.append(
-                {"params": [cloud.rotations], "lr": cfg.static_gs.lr_means})
+                {"params": [cloud.rotations], "lr": lr_means_init})
         opt = torch.optim.Adam(params, lr=cfg.static_gs.lr_means)
-        sched = torch.optim.lr_scheduler.ExponentialLR(
-            opt, gamma=0.992)
+
+        # Decoupled 3DGS schedules:
+        # means & rotations: exponential decay from lr_init to lr_final (0.01x)
+        # scales, opacities, sh: sustained cosine decay down to 20% of initial lr
+        gamma_means = (0.01) ** (1.0 / max(1, iters))
+        sched_funcs = [
+            lambda step: gamma_means ** step,                            # means
+            lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # scales
+            lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # opacities
+            lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # sh
+        ]
+        if cfg.model.predict_rotation:
+            sched_funcs.append(lambda step: gamma_means ** step)         # rotations
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=sched_funcs)
 
         history: List[float] = []
         bg = torch.ones(3, device=dev) if cfg.data.white_background else None
@@ -290,7 +305,7 @@ class StaticGSInit:
 
             # Keep parameters physically bounded during optimization
             with torch.no_grad():
-                cloud.scales.data.clamp_(-6.0, -3.8)
+                cloud.scales.data.clamp_(-7.0, -3.2)
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-3.5, 4.0)
 
