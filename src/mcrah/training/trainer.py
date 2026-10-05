@@ -98,19 +98,12 @@ class MCRAHTrainer:
 
         self._lpips_module = None
         self._scheduler = None
-        self.state = TrainState(stage=cfg.train.stage)
-        self.set_stage(cfg.train.stage)
-
         # Automatic Mixed Precision (AMP) for GPU speedup.
         # On CPU/MPS this is a no-op (enabled=False).
         self._use_amp = bool(cfg.train.use_amp) and self.device == "cuda"
         self._scaler = None
-        if self._use_amp:
-            try:
-                self._scaler = torch.amp.GradScaler("cuda")
-            except (TypeError, AttributeError):
-                # PyTorch < 2.4: GradScaler takes no device arg.
-                self._scaler = torch.cuda.amp.GradScaler()
+        self.state = TrainState(stage=cfg.train.stage)
+        self.set_stage(cfg.train.stage)
 
     # ------------------------------------------------------------------ #
     # Perceptual Loss
@@ -170,6 +163,12 @@ class MCRAHTrainer:
             )
         else:
             self._scheduler = None
+
+        if self._use_amp:
+            try:
+                self._scaler = torch.amp.GradScaler("cuda")
+            except (TypeError, AttributeError):
+                self._scaler = torch.cuda.amp.GradScaler()
 
         lr_curr = self._opt.param_groups[0]["lr"]
         print(f"[trainer] stage -> {stage} "
@@ -341,10 +340,11 @@ class MCRAHTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.train.grad_clip)
             scale_before = self._scaler.get_scale()
-            self._scaler.step(self._opt)
+            scaler_ret = self._scaler.step(self._opt)
             self._scaler.update()
             scale_after = self._scaler.get_scale()
-            step_successful = scale_after >= scale_before
+            opt_stepped = getattr(self._opt, "_step_count", 0) > 0
+            step_successful = (scaler_ret is not None) or (scale_after >= scale_before and opt_stepped)
         else:
             pred, target, deltas, steps = self._rollout_and_render(window)
             loss, metrics = self._compute_loss(
@@ -356,7 +356,7 @@ class MCRAHTrainer:
             step_successful = True
 
         self.noise.step()
-        if self._scheduler is not None and step_successful:
+        if self._scheduler is not None and step_successful and getattr(self._opt, "_step_count", 0) > 0:
             self._scheduler.step()
         metrics["lr"] = float(self._opt.param_groups[0]["lr"])
         self.state.step += 1
