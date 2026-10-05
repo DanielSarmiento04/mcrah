@@ -91,15 +91,16 @@ def run_category(cfg: Config, category: str, args) -> dict:
         print(f"\n[{category}] training stage: {stage} ({iters} iters)")
         trainer.set_stage(stage, total_steps=iters)
         for it in range(iters):
-            # Sample a random mini-batch of frames.
-            idx = torch.randint(0, len(samples), (cfg.train.batch_views,))
-            batch = [samples[i] for i in idx]
-            m = trainer.train_step(batch)
+            # Pass full sample pool so _sample_window can extract a continuous time_window rollout
+            m = trainer.train_step(samples)
             if (it + 1) % max(1, iters // 5) == 0:
                 lp_str = f"  lpips={m['lpips']:.4f}" if m.get("lpips", 0.0) > 0.0 else ""
                 lr_str = f"  lr={m['lr']:.6f}" if "lr" in m else ""
+                rig_str = f"  rig={m['rigidity']:.5f}" if m.get("rigidity", 0.0) > 0.0 else ""
+                top_str = f"  topo={m['topology']:.5f}" if m.get("topology", 0.0) > 0.0 else ""
+                pde_str = f"  pde={m['pde']:.5f}" if m.get("pde", 0.0) > 0.0 else ""
                 print(f"  it {it+1}/{iters}  loss={m['loss']:.5f}  "
-                      f"photo={m['photo']:.5f}{lr_str}{lp_str}  rel_l2={m['rel_l2']:.5f}")
+                      f"photo={m['photo']:.5f}{lr_str}{lp_str}  rel_l2={m['rel_l2']:.5f}{rig_str}{top_str}{pde_str}")
         trainer.save(tag=stage)
 
     # ---- Phase 4: evaluation ----------------------------------------- #
@@ -197,6 +198,7 @@ def main():
         cfg.static_gs.num_gaussians = args.num_gaussians
     if args.render_wh is not None:
         cfg.data.render_wh = tuple(args.render_wh)
+        cfg.train.cuda_render_wh = tuple(args.render_wh)
     if args.time_window is not None:
         cfg.train.time_window = args.time_window
     if args.category:

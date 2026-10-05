@@ -113,7 +113,8 @@ class MCRAHGate(nn.Module):
         mask_0 = F.one_hot(
             assignment_0.clamp_min(0).clamp_max(E - 1), num_classes=E
         ).float()                                            # (N, E)
-        prior = self.prior_logit.float() * (2.0 * mask_0 - 1.0)     # +pl assigned, -pl else
+        pl = self.prior_logit.clamp(-10.0, 10.0).float()
+        prior = pl * (2.0 * mask_0 - 1.0)     # +pl assigned, -pl else
         logits = logits + prior
 
         res = logits.softmax(dim=-1).to(node_feat.dtype)    # (N, E)
@@ -237,7 +238,8 @@ class RigidityLoss(nn.Module):
         expected = membership @ centroid_disp             # (N, 3)
 
         residual = node_disp - expected                  # (N, 3)
-        return (residual ** 2).sum(dim=-1).mean()
+        res = (residual ** 2).sum(dim=-1).mean()
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class TopologySmoothnessLoss(nn.Module):
@@ -253,7 +255,8 @@ class TopologySmoothnessLoss(nn.Module):
         super().__init__()
 
     def forward(self, M_t: torch.Tensor, M_prev: torch.Tensor) -> torch.Tensor:
-        return ((M_t - M_prev) ** 2).sum() / M_t.shape[0]
+        res = ((M_t - M_prev) ** 2).sum() / max(1, M_t.shape[0])
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -336,12 +339,14 @@ def _scatter_mean(src: torch.Tensor, index: torch.Tensor, dim_size: int
 
     Returns (dim_size, D).
     """
+    idx = index.clamp_min(0).clamp_max(max(0, dim_size - 1))
     out = torch.zeros(dim_size, src.shape[-1], device=src.device, dtype=src.dtype)
     count = torch.zeros(dim_size, 1, device=src.device, dtype=src.dtype)
-    out.index_add_(0, index, src)
-    count.index_add_(0, index, torch.ones(src.shape[0], 1,
-                                           device=src.device, dtype=src.dtype))
-    return out / count.clamp_min(1.0)
+    out.index_add_(0, idx, src)
+    count.index_add_(0, idx, torch.ones(src.shape[0], 1,
+                                         device=src.device, dtype=src.dtype))
+    res = out / count.clamp_min(1.0)
+    return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def compute_centroids(means: torch.Tensor, assignment: torch.Tensor,

@@ -195,8 +195,13 @@ class MCRAHTrainer:
         else:
             start = torch.randint(0, len(times) - tw + 1, (1,)).item()
             window = times[start:start + tw]
-        # Pick one representative view per time step.
-        return [by_time[t][0] for t in window]
+        # Pick a random representative view per time step for multi-view consistency.
+        window_samples = []
+        for t in window:
+            cands = by_time[t]
+            v_idx = torch.randint(0, len(cands), (1,)).item() if len(cands) > 1 else 0
+            window_samples.append(cands[v_idx])
+        return window_samples
 
     def _rollout_and_render(
         self,
@@ -335,8 +340,11 @@ class MCRAHTrainer:
             self._scaler.unscale_(self._opt)
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.train.grad_clip)
+            scale_before = self._scaler.get_scale()
             self._scaler.step(self._opt)
             self._scaler.update()
+            scale_after = self._scaler.get_scale()
+            step_successful = scale_after >= scale_before
         else:
             pred, target, deltas, steps = self._rollout_and_render(window)
             loss, metrics = self._compute_loss(
@@ -345,9 +353,10 @@ class MCRAHTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.train.grad_clip)
             self._opt.step()
+            step_successful = True
 
         self.noise.step()
-        if self._scheduler is not None:
+        if self._scheduler is not None and step_successful:
             self._scheduler.step()
         metrics["lr"] = float(self._opt.param_groups[0]["lr"])
         self.state.step += 1

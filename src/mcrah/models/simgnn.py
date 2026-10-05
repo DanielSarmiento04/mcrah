@@ -184,19 +184,29 @@ class OffsetHeads(nn.Module):
 
 
 def axis_angle_to_quaternion(rotvec: torch.Tensor) -> torch.Tensor:
-    """Convert (N,3) axis-angle to (N,4) quaternion (w,x,y,z), normalized.
-    A near-zero rotvec yields the identity quaternion (1,0,0,0)."""
-    angle = rotvec.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    axis = rotvec / angle
-    half = angle * 0.5
-    sin = torch.sin(half)
-    cos = torch.cos(half)
-    q = torch.cat([cos, axis * sin], dim=-1)
-    # Identity when angle ~ 0 (numerically stable).
-    identity = torch.tensor([1.0, 0.0, 0.0, 0.0], device=rotvec.device,
-                            dtype=rotvec.dtype)
-    near_zero = (angle < 1e-6).expand_as(q)
-    return torch.where(near_zero, identity.expand_as(q), q)
+    """Convert (...,3) axis-angle to (...,4) quaternion (w,x,y,z), normalized.
+    Numerically safe under FP16/AMP and FP32 for arbitrarily small angles."""
+    orig_dtype = rotvec.dtype
+    r = rotvec.float()  # compute in float32 for AMP stability
+    angle_sq = (r ** 2).sum(dim=-1, keepdim=True)
+
+    small_mask = angle_sq < 1e-8
+
+    # Large angle calculation
+    angle = torch.sqrt(angle_sq.clamp_min(1e-8))
+    scale_large = torch.sin(0.5 * angle) / angle
+    cos_large = torch.cos(0.5 * angle)
+
+    # Small angle calculation (Taylor expansion for sin(x/2)/x ~ 0.5 - x^2/48)
+    scale_small = 0.5 - angle_sq / 48.0
+    cos_small = 1.0 - angle_sq / 8.0
+
+    scale = torch.where(small_mask, scale_small, scale_large)
+    cos = torch.where(small_mask, cos_small, cos_large)
+
+    q = torch.cat([cos, r * scale], dim=-1)
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return q.to(orig_dtype)
 
 
 class SIMGNN(nn.Module):

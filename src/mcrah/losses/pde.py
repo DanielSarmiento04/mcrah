@@ -95,4 +95,5 @@ class PDERegularizer(nn.Module):
         if offsets.shape[0] < 3:
             return offsets.new_zeros(())
         d2 = offsets[2:] - 2 * offsets[1:-1] + offsets[:-2]  # (T-2,N,D)
-        return self.lam * (d2 ** 2).mean()
+        res = self.lam * (d2 ** 2).mean()
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
