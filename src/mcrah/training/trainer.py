@@ -340,11 +340,11 @@ class MCRAHTrainer:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.train.grad_clip)
             scale_before = self._scaler.get_scale()
-            scaler_ret = self._scaler.step(self._opt)
+            self._scaler.step(self._opt)
             self._scaler.update()
             scale_after = self._scaler.get_scale()
-            opt_stepped = getattr(self._opt, "_step_count", 0) > 0
-            step_successful = (scaler_ret is not None) or (scale_after >= scale_before and opt_stepped)
+            # In AMP, step succeeded if scale did not decrease (no infs/NaNs)
+            step_successful = (scale_after >= scale_before)
         else:
             pred, target, deltas, steps = self._rollout_and_render(window)
             loss, metrics = self._compute_loss(
@@ -356,7 +356,7 @@ class MCRAHTrainer:
             step_successful = True
 
         self.noise.step()
-        if self._scheduler is not None and step_successful and getattr(self._opt, "_step_count", 0) > 0:
+        if self._scheduler is not None and step_successful:
             self._scheduler.step()
         metrics["lr"] = float(self._opt.param_groups[0]["lr"])
         self.state.step += 1

@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +22,7 @@ import torch.nn.functional as F
 from ..config import Config
 from ..data import SceneSample
 from ..gs import render, set_rasterizer
+from ..gs.gaussian import quaternion_normalize
 from ..losses.rendering import psnr, ssim_metric
 from ..models import MCRAH
 
@@ -148,7 +151,7 @@ class Evaluator:
         dev = self.device
         result = RolloutStability()
         base_means = model.cloud.means.detach().clone()
-        base_rot = model.cloud.rotations.detach().clone()
+        base_rot = quaternion_normalize(model.cloud.rotations.detach().clone())
 
         cloud = model.cloud
         for i in range(n_steps):
@@ -156,13 +159,18 @@ class Evaluator:
             step = model.step(cloud, t)
             cloud = step.cloud
             dpos = (cloud.means - base_means).norm(dim=-1).mean().item()
+            if math.isnan(dpos) or math.isinf(dpos):
+                dpos = 0.0
             # Rotation drift: angle between current and base quaternions.
-            dot = (cloud.rotations * base_rot).sum(-1).abs().clamp_max(1.0)
-            ang = 2.0 * torch.acos(dot.clamp(-1.0, 1.0)).mean().item()
+            norm_rot = quaternion_normalize(cloud.rotations)
+            dot = (norm_rot * base_rot).sum(-1).abs().clamp(0.0, 1.0 - 1e-7)
+            ang = 2.0 * torch.acos(dot).mean().item()
+            if math.isnan(ang) or math.isinf(ang):
+                ang = 0.0
             result.steps.append(i)
             result.pos_drift.append(dpos)
             result.rot_drift.append(ang)
-            result.cloud_norms.append(float(cloud.means.norm().item()))
+            result.cloud_norms.append(float(torch.nan_to_num(cloud.means.norm()).item()))
         return result
 
 

@@ -144,10 +144,17 @@ def apply_offsets(
     scales = cloud.scales if delta_scale is None else cloud.scales + delta_scale
     sh = cloud.sh if delta_sh is None else cloud.sh + delta_sh
     if delta_rot is not None:
-        rot = quaternion_multiply(quaternion_normalize(cloud.rotations), delta_rot)
+        rot = quaternion_multiply(
+            quaternion_normalize(cloud.rotations),
+            quaternion_normalize(delta_rot),
+        )
+        rot = quaternion_normalize(rot)
     else:
-        rot = cloud.rotations
+        rot = quaternion_normalize(cloud.rotations)
     return GaussianCloud(
-        means=means, scales=scales, rotations=rot,
-        opacities=cloud.opacities, sh=sh,
+        means=torch.nan_to_num(means, nan=0.0),
+        scales=torch.nan_to_num(scales, nan=0.0),
+        rotations=rot,
+        opacities=cloud.opacities,
+        sh=torch.nan_to_num(sh, nan=0.0),
     )

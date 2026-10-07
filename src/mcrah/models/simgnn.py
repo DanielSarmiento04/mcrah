@@ -95,7 +95,7 @@ class FeatureEncoder(nn.Module):
         op = cloud.opacities[:, :1]
         raw = torch.cat([pos_feat, cloud.scales, cloud.sh, op], dim=-1)
         h = self.proj(raw)
-        cid = cluster_id.clamp_min(0)
+        cid = cluster_id.clamp(0, self.cluster_emb.num_embeddings - 1)
         h = h + self.cluster_emb(cid)
         h = h + self.time_mlp(time_feat)
         return h
@@ -175,9 +175,11 @@ class OffsetHeads(nn.Module):
     def forward(self, h: torch.Tensor):
         damp = self.damp_head(h)  # (N, 1) in (0, 1)
         delta_pos = (self.pos_scale * torch.tanh(self.pos_head(h))) * damp
+        delta_pos = torch.nan_to_num(delta_pos, nan=0.0)
         if self.predict_rotation:
             rotvec = self.rot_head(h) * damp
             delta_rot = axis_angle_to_quaternion(rotvec)
+            delta_rot = torch.nan_to_num(delta_rot, nan=0.0)
         else:
             delta_rot = None
         return delta_pos, delta_rot

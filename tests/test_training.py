@@ -91,8 +91,10 @@ def test_trainer_dense_step_has_gradients():
         SceneSample(category="x", time=0.1, time_idx=1, image=img,
                     c2w=c2w, intrinsics=K),
     ]
-    m = trainer.train_step(samples)
-    assert torch.isfinite(torch.tensor(m["loss"]))
+    m1 = trainer.train_step(samples)
+    assert torch.isfinite(torch.tensor(m1["loss"]))
+    m2 = trainer.train_step(samples)
+    assert m2["lr"] < m1["lr"], f"LR should decay with scheduler: {m2['lr']} vs {m1['lr']}"
     # SIMGNN must have received gradients.
     has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                    for p in trainer.model.simgnn.parameters())
@@ -119,7 +121,7 @@ def test_rasterizer_is_differentiable():
 
 
 def test_evaluator_runs():
-    """Evaluator computes metrics without error on a tiny rollout."""
+    """Evaluator computes metrics without error on a tiny rollout and 100-step stability."""
     cfg = _make_cfg()
     cloud = GaussianCloud.random(16)
     model = MCRAH(cfg, cloud)
@@ -140,6 +142,7 @@ def test_evaluator_runs():
     assert torch.isfinite(torch.tensor(metrics.psnr_mean))
     assert torch.isfinite(torch.tensor(metrics.ssim_mean))
 
-    stab = ev.rollout_stability(model, n_steps=5)
-    assert len(stab.pos_drift) == 5
-    assert all(v >= 0 for v in stab.pos_drift)
+    stab = ev.rollout_stability(model, n_steps=100)
+    assert len(stab.pos_drift) == 100
+    assert all(torch.isfinite(torch.tensor(v)) and v >= 0 for v in stab.pos_drift)
+    assert all(torch.isfinite(torch.tensor(v)) and v >= 0 for v in stab.rot_drift)

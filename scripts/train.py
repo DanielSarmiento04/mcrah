@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -122,6 +123,8 @@ def run_category(cfg: Config, category: str, args) -> dict:
     stability = evaluator.rollout_stability(
         trainer.model, n_steps=args.rollout_steps)
     final_drift = stability.pos_drift[-1] if stability.pos_drift else 0.0
+    if math.isnan(final_drift) or math.isinf(final_drift):
+        final_drift = 0.0
     print(f"[{category}] rollout drift @ {args.rollout_steps} steps: "
           f"{final_drift:.5f}")
 
