@@ -141,12 +141,32 @@ class MCRAHTrainer:
         else:
             lr = cfg.train.lr
 
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if not params:
-            # Avoid empty-param error in edge cases (e.g. eval-only).
-            params = [torch.zeros(1, requires_grad=True, device=self.device)]
-        return torch.optim.AdamW(
-            params, lr=lr, weight_decay=cfg.train.weight_decay)
+        net_params = []
+        cloud_params = []
+        cloud_names = {"_cloud_sh", "_cloud_opacities", "_cloud_scales", "_cloud_means"}
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                if any(cn in name for cn in cloud_names):
+                    cloud_params.append(p)
+                else:
+                    net_params.append(p)
+
+        param_groups = []
+        if net_params:
+            param_groups.append({
+                "params": net_params, "lr": lr, "weight_decay": cfg.train.weight_decay
+            })
+        if cloud_params:
+            # Fine-tune canonical appearance gently without weight decay
+            cloud_lr = min(lr, 5e-4)
+            param_groups.append({
+                "params": cloud_params, "lr": cloud_lr, "weight_decay": 0.0
+            })
+
+        if not param_groups:
+            param_groups.append({"params": [torch.zeros(1, requires_grad=True, device=self.device)], "lr": lr})
+
+        return torch.optim.AdamW(param_groups)
 
     def set_stage(self, stage: str, total_steps: Optional[int] = None) -> None:
         """Switch the decoupled training stage and rebuild the optimizer and scheduler."""

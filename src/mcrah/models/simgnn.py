@@ -150,7 +150,7 @@ class OffsetHeads(nn.Module):
         self.pos_head = nn.Sequential(
             nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 3)
         )
-        nn.init.normal_(self.pos_head[-1].weight, std=1e-4)
+        nn.init.normal_(self.pos_head[-1].weight, std=2e-3)
         nn.init.zeros_(self.pos_head[-1].bias)
 
         # Residual motion damping head: modulates velocity/offset magnitude
@@ -169,7 +169,7 @@ class OffsetHeads(nn.Module):
             self.rot_head = nn.Sequential(
                 nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 3)
             )
-            nn.init.normal_(self.rot_head[-1].weight, std=1e-4)
+            nn.init.normal_(self.rot_head[-1].weight, std=2e-3)
             nn.init.zeros_(self.rot_head[-1].bias)
 
     def forward(self, h: torch.Tensor):

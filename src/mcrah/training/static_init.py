@@ -258,7 +258,7 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-7.0, -3.2)
+            cloud.scales.data.clamp_(-7.5, -4.2)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         lr_means_init = cfg.static_gs.lr_means * 1.5

@@ -77,10 +77,7 @@ class MCRAHGate(nn.Module):
             nn.SiLU(),
             nn.Linear(feat_dim, feat_dim),
         )
-        # Learnable prior strength: how much to trust the initial assignment.
-        # Initialized high so the model starts close to the static hypergraph
-        # and gradually learns to deviate where motion demands it.
-        self.prior_logit = nn.Parameter(torch.tensor(3.0))
+        self.register_buffer("prior_logit", torch.tensor(3.0))
 
     def forward(
         self,

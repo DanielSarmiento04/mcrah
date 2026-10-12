@@ -96,12 +96,12 @@ class MCRAH(nn.Module):
 
     # -- cloud management -------------------------------------------------- #
     def register_cloud(self, cloud: GaussianCloud) -> None:
-        """Store the static cloud's tensors as non-persistent buffers so they
-        move with .to(device) but aren't saved in the checkpoint."""
-        for name, t in [("means", cloud.means), ("scales", cloud.scales),
-                        ("rotations", cloud.rotations),
-                        ("opacities", cloud.opacities), ("sh", cloud.sh)]:
-            self.register_buffer(f"_cloud_{name}", t.clone(), persistent=False)
+        """Store the static cloud's tensors as parameters."""
+        self._cloud_means = nn.Parameter(cloud.means.clone(), requires_grad=False)
+        self._cloud_scales = nn.Parameter(cloud.scales.clone(), requires_grad=False)
+        self._cloud_rotations = nn.Parameter(cloud.rotations.clone(), requires_grad=False)
+        self._cloud_opacities = nn.Parameter(cloud.opacities.clone(), requires_grad=False)
+        self._cloud_sh = nn.Parameter(cloud.sh.clone(), requires_grad=False)
 
     @property
     def cloud(self) -> GaussianCloud:
@@ -180,7 +180,7 @@ class MCRAH(nn.Module):
         """Freeze submodules for decoupled two-stage training.
         ``"dense"`` trains SIMGNN only (DHGC frozen).
         ``"farfield"`` trains DHGC only (SIMGNN frozen).
-        ``"joint"`` trains everything.
+        ``"joint"`` trains everything + refines canonical appearance.
         """
         if stage not in ("dense", "farfield", "joint"):
             raise ValueError(f"unknown stage: {stage}")
@@ -188,6 +188,13 @@ class MCRAH(nn.Module):
             p.requires_grad = stage in ("dense", "joint")
         for p in self.dhgc.parameters():
             p.requires_grad = stage in ("farfield", "joint")
+        if self.use_mcrah and self.mcrah is not None:
+            for p in self.mcrah.parameters():
+                p.requires_grad = stage in ("dense", "joint")
+        # In joint stage, allow canonical appearance (SH & opacities) to fine-tune
+        if hasattr(self, "_cloud_sh") and hasattr(self, "_cloud_opacities"):
+            self._cloud_sh.requires_grad = (stage == "joint")
+            self._cloud_opacities.requires_grad = (stage == "joint")
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
