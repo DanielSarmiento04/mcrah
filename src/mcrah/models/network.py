@@ -34,6 +34,7 @@ from .dhgc import DHGC
 from .hypergraph import (
     Hypergraph, DilatedStructure,
     build_hypergraph_from_features,
+    build_dilated_structure_from_hypergraph,
 )
 from .mcrah import MCRAHCore, compute_centroids
 
@@ -73,7 +74,12 @@ class MCRAH(nn.Module):
                 cloud.means.detach(), seed=cfg.hypergraph.seed
             )
         self.hypergraph = hypergraph
-        self.dilated = dilated  # may be None in Stage-1-only training
+        if dilated is None:
+            dilated = build_dilated_structure_from_hypergraph(
+                self.hypergraph, coords=cloud.means.detach(),
+                levels=cfg.hypergraph.dilation_levels, seed=cfg.hypergraph.seed
+            )
+        self.dilated = dilated
 
         cluster_id = self.hypergraph.assignment.to(cloud.means.device)
         self.register_buffer("cluster_id", cluster_id, persistent=False)

@@ -204,3 +204,21 @@ def test_gaussian_scale_clamp(tiny_cloud):
     tiny_cloud.scales.data.fill_(1.0)  # very large pre-activation scale
     act = tiny_cloud.activated()
     assert (act.scales <= 0.015 + 1e-6).all()
+
+
+def test_all_three_stages_train_step(tiny_cloud, cfg):
+    """Dense, farfield, and joint stages all execute train_step without grad_fn errors."""
+    trainer = MCRAHTrainer(cfg, tiny_cloud, out_dir="/tmp/mcrah_test_stages")
+    K = torch.tensor([[400.0, 0.0, 100.0], [0.0, 400.0, 100.0], [0.0, 0.0, 1.0]])
+    c2w = torch.eye(4); c2w[2, 3] = -4.0
+    img = torch.rand(3, 32, 32)
+    samples = [
+        SceneSample(category="x", time=0.0, time_idx=0, image=img, c2w=c2w, intrinsics=K),
+        SceneSample(category="x", time=0.1, time_idx=1, image=img, c2w=c2w, intrinsics=K),
+    ]
+
+    for stage in ["dense", "farfield", "joint"]:
+        trainer.set_stage(stage, total_steps=5)
+        m = trainer.train_step(samples)
+        assert "loss" in m
+        assert m["loss"] > 0.0

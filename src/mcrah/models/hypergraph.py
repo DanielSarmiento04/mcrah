@@ -212,6 +212,70 @@ def load_dilated_structure(path: Path | str, levels: Tuple[int, ...],
     return DilatedStructure(levels=levels, padded=padded, mask=mask)
 
 
+def build_dilated_structure_from_hypergraph(
+    hypergraph: Hypergraph,
+    coords: Optional[torch.Tensor] = None,
+    levels: Tuple[int, ...] = (1, 2, 4),
+    max_neighbors: int = 32,
+    seed: int = 42,
+) -> DilatedStructure:
+    """Pure-Python multi-scale dilated neighbor structure construction.
+
+    For each dilation level k in ``levels``, constructs restricted neighbor
+    sets:
+      * k = 1: intra-hyperedge neighbors (nodes sharing the same cluster).
+      * k > 1: multi-scale far-field context (nodes from adjacent/nearby clusters).
+    """
+    N = hypergraph.n_nodes
+    E = hypergraph.n_edges
+    rng = np.random.default_rng(seed)
+
+    # Compute cluster centroids in numpy if coords available, else dummy order
+    if coords is not None and coords.shape[0] == N:
+        c_np = coords.detach().cpu().numpy()
+        centroids = np.zeros((E, c_np.shape[-1]), dtype=np.float32)
+        for e in range(E):
+            m = hypergraph.edge_lists[e]
+            if len(m) > 0:
+                centroids[e] = c_np[m].mean(axis=0)
+        c_dist = np.linalg.norm(centroids[:, None] - centroids[None, :], axis=-1)
+        c_order = np.argsort(c_dist, axis=-1)
+    else:
+        c_order = np.tile(np.arange(E), (E, 1))
+
+    padded = {}
+    mask = {}
+
+    for k in levels:
+        n_clusters_to_pool = min(E, max(1, 1 + (k - 1) * 3)) if k > 1 else 1
+        idx_arr = np.full((N, max_neighbors), -1, dtype=np.int64)
+        mask_arr = np.zeros((N, max_neighbors), dtype=bool)
+
+        for e in range(E):
+            members = hypergraph.edge_lists[e]
+            if not members:
+                continue
+            pool_clusters = c_order[e, :n_clusters_to_pool]
+            pool_nodes = []
+            for c in pool_clusters:
+                pool_nodes.extend(hypergraph.edge_lists[c])
+            pool_nodes = np.array(pool_nodes, dtype=np.int64)
+
+            n_pool = len(pool_nodes)
+            if n_pool <= max_neighbors:
+                idx_arr[members, :n_pool] = pool_nodes
+                mask_arr[members, :n_pool] = True
+            else:
+                sampled = rng.choice(pool_nodes, size=(len(members), max_neighbors), replace=True)
+                idx_arr[members] = sampled
+                mask_arr[members] = True
+
+        padded[k] = torch.from_numpy(idx_arr)
+        mask[k] = torch.from_numpy(mask_arr)
+
+    return DilatedStructure(levels=levels, padded=padded, mask=mask)
+
+
 def build_hypergraph_from_features(feats: torch.Tensor, k: Optional[int] = None,
                                     seed: int = 42) -> Hypergraph:
     """Pure-Python cosine-similarity k-means clustering fallback.

@@ -355,25 +355,31 @@ class MCRAHTrainer:
                 pred, target, deltas, steps = self._rollout_and_render(window)
                 loss, metrics = self._compute_loss(
                     pred, target, deltas, self.model.cloud, steps)
-            self._scaler.scale(loss).backward()
-            self._scaler.unscale_(self._opt)
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.cfg.train.grad_clip)
-            scale_before = self._scaler.get_scale()
-            self._scaler.step(self._opt)
-            self._scaler.update()
-            scale_after = self._scaler.get_scale()
-            # In AMP, step succeeded if scale did not decrease (no infs/NaNs)
-            step_successful = (scale_after >= scale_before)
+            if loss.requires_grad and loss.grad_fn is not None:
+                self._scaler.scale(loss).backward()
+                self._scaler.unscale_(self._opt)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.train.grad_clip)
+                scale_before = self._scaler.get_scale()
+                self._scaler.step(self._opt)
+                self._scaler.update()
+                scale_after = self._scaler.get_scale()
+                # In AMP, step succeeded if scale did not decrease (no infs/NaNs)
+                step_successful = (scale_after >= scale_before)
+            else:
+                step_successful = False
         else:
             pred, target, deltas, steps = self._rollout_and_render(window)
             loss, metrics = self._compute_loss(
                 pred, target, deltas, self.model.cloud, steps)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.cfg.train.grad_clip)
-            self._opt.step()
-            step_successful = True
+            if loss.requires_grad and loss.grad_fn is not None:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.train.grad_clip)
+                self._opt.step()
+                step_successful = True
+            else:
+                step_successful = False
 
         self.noise.step()
         if self._scheduler is not None and step_successful:
