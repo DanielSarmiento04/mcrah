@@ -181,3 +181,26 @@ def test_static_init_decoupled_schedule():
     assert len(result.history) == 12
     # Final loss should be lower than starting loss
     assert result.history[-1] < result.history[0]
+
+
+def test_canonical_appearance_joint_finetune(tiny_cloud, cfg):
+    """In joint stage, canonical appearance parameters receive gradients."""
+    hg = build_hypergraph_from_features(tiny_cloud.means.detach(), k=4, seed=0)
+    trainer = MCRAHTrainer(cfg, tiny_cloud, hypergraph=hg, out_dir="/tmp/mcrah_test_joint")
+
+    # In dense stage: cloud parameters should be frozen
+    trainer.set_stage("dense")
+    assert not trainer.model._cloud_sh.requires_grad
+    assert not trainer.model._cloud_opacities.requires_grad
+
+    # In joint stage: appearance should be trainable
+    trainer.set_stage("joint")
+    assert trainer.model._cloud_sh.requires_grad
+    assert trainer.model._cloud_opacities.requires_grad
+
+
+def test_gaussian_scale_clamp(tiny_cloud):
+    """Gaussian activation clamps scales to <= 0.015 for sharp bone geometry."""
+    tiny_cloud.scales.data.fill_(1.0)  # very large pre-activation scale
+    act = tiny_cloud.activated()
+    assert (act.scales <= 0.015 + 1e-6).all()
