@@ -186,9 +186,9 @@ class MCRAHTrainer:
 
         if self._use_amp:
             try:
-                self._scaler = torch.amp.GradScaler("cuda")
+                self._scaler = torch.amp.GradScaler("cuda", init_scale=4096.0)
             except (TypeError, AttributeError):
-                self._scaler = torch.cuda.amp.GradScaler()
+                self._scaler = torch.cuda.amp.GradScaler(init_scale=4096.0)
 
         lr_curr = self._opt.param_groups[0]["lr"]
         print(f"[trainer] stage -> {stage} "
@@ -242,7 +242,14 @@ class MCRAHTrainer:
 
         preds, tgts = [], []
         for s, step in zip(window, steps):
-            K = s.intrinsics.to(dev)
+            K = s.intrinsics.clone().to(dev)
+            orig_w = float(K[0, 2].item() * 2.0 + 1.0)
+            orig_h = float(K[1, 2].item() * 2.0 + 1.0)
+            if abs(orig_w - W) > 2.0 and orig_w > 0 and orig_h > 0:
+                K[0, 0] *= W / orig_w
+                K[1, 1] *= H / orig_h
+                K[0, 2] = 0.5 * (W - 1.0)
+                K[1, 2] = 0.5 * (H - 1.0)
             c2w = s.c2w.to(dev)
             out = render(step.cloud, c2w, K, width=W, height=H, bg_color=bg)
             preds.append(out.image)
@@ -287,13 +294,14 @@ class MCRAHTrainer:
             stacked = torch.stack(deltas, dim=0)  # (T,N,3)
             pde = self.pde_reg(stacked)
         else:
-            pde = pred.new_zeros(())
+            pde = pred.new_zeros((), dtype=torch.float32)
 
         # MCRAH novel losses (only if adaptive hypergraph is active).
-        rig, topo = pred.new_zeros(()), pred.new_zeros(())
+        rig = pred.new_zeros((), dtype=torch.float32)
+        topo = pred.new_zeros((), dtype=torch.float32)
+        mc = cfg.mcrah_loss
         if (steps is not None and self.cfg.hypergraph.adaptive
                 and self.model.mcrah is not None):
-            mc = cfg.mcrah_loss
             memberships = [s.membership for s in steps if s.membership is not None]
             clouds_t = [s.cloud for s in steps if s.membership is not None]
             if memberships:
@@ -310,13 +318,13 @@ class MCRAHTrainer:
                         for i in range(1, len(memberships))) / (len(memberships) - 1)
 
         # Perceptual LPIPS loss (active during joint fine-tuning stage)
-        lp_loss = pred.new_zeros(())
+        lp_loss = pred.new_zeros((), dtype=torch.float32)
         w_lpips = getattr(cfg.train, "w_lpips", 0.0)
         if self.state.stage == "joint" and w_lpips > 0.0:
             lpips_fn = self._get_lpips()
             if lpips_fn is not None:
-                p_norm = (pred * 2.0 - 1.0).clamp(-1.0, 1.0).float()
-                t_norm = (target * 2.0 - 1.0).clamp(-1.0, 1.0).float()
+                p_norm = (pred.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
+                t_norm = (target.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
                 lp_loss = lpips_fn(p_norm, t_norm).mean()
 
         loss = (photo + cfg.train.w_rel_l2 * rel + pde
@@ -353,9 +361,10 @@ class MCRAHTrainer:
                 amp_ctx = torch.cuda.amp.autocast()
             with amp_ctx:
                 pred, target, deltas, steps = self._rollout_and_render(window)
-                loss, metrics = self._compute_loss(
-                    pred, target, deltas, self.model.cloud, steps)
-            if loss.requires_grad and loss.grad_fn is not None:
+            # Compute all losses strictly in float32 outside autocast
+            loss, metrics = self._compute_loss(
+                pred, target, deltas, self.model.cloud, steps)
+            if loss.requires_grad and loss.grad_fn is not None and torch.isfinite(loss):
                 self._scaler.scale(loss).backward()
                 self._scaler.unscale_(self._opt)
                 torch.nn.utils.clip_grad_norm_(

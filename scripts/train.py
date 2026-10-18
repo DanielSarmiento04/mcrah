@@ -30,14 +30,13 @@ from mcrah.training import (
 )
 
 
-def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.04, min_views: int = 6):
+def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, min_views: int = 12):
     """Load early / near t=0 training views for static 3DGS initialization.
     
     A single 2D view is mathematically ill-posed for 3D reconstruction and causes
     3DGS to collapse into a flat 2D billboard. We gather multi-view cameras from
     the earliest time frames (t <= max_t, minimum min_views) where motion is
-    negligible (<4% of trajectory) to reconstruct the true 360-degree base geometry
-    without temporal motion blur or ghosting.
+    negligible to reconstruct the true 360-degree base geometry without floaters.
     """
     ds = DNeRFDataset(cfg, split="train", categories=[category])
     sorted_idxs = sorted(range(len(ds)), key=lambda i: ds[i].time)
@@ -183,10 +182,10 @@ def main():
     p.add_argument("--stage", default=None,
                    choices=["dense", "farfield", "joint"],
                    help="train a single stage only")
-    p.add_argument("--max-t0", type=float, default=0.04,
-                   help="max time threshold for static t=0 view selection (default: 0.04)")
-    p.add_argument("--min-t0-views", type=int, default=6,
-                   help="minimum multi-view cameras for static initialization (default: 6)")
+    p.add_argument("--max-t0", type=float, default=0.06,
+                   help="max time threshold for static t=0 view selection (default: 0.06)")
+    p.add_argument("--min-t0-views", type=int, default=12,
+                   help="minimum multi-view cameras for static initialization (default: 12)")
     p.add_argument("--skip-static", action="store_true",
                    help="reuse existing static cloud if present")
     p.add_argument("--quick", action="store_true",

@@ -166,14 +166,16 @@ class AdaptiveHypergraph(nn.Module):
 
         Θ x = D_v^{-1/2} M W D_e^{-1} M^T D_v^{-1/2} x
         """
-        M = self.membership                              # (N, E)
+        orig_dtype = x.dtype
+        x_f = x.float()
+        M = self.membership.float()                      # (N, E)
         E = self.n_edges
         dev = x.device
 
         if edge_weight is None:
-            w = torch.ones(E, device=dev, dtype=x.dtype)
+            w = torch.ones(E, device=dev, dtype=torch.float32)
         else:
-            w = edge_weight.to(dev).to(x.dtype)
+            w = edge_weight.to(dev).float()
 
         # Vertex / edge degrees under soft membership.
         d_v = M.sum(dim=1).clamp_min(1.0)                 # (N,)
@@ -181,7 +183,7 @@ class AdaptiveHypergraph(nn.Module):
 
         # 1. D_v^{-1/2} x
         dv_inv_sqrt = (1.0 / d_v).sqrt()
-        x1 = x * dv_inv_sqrt.unsqueeze(-1)               # (N, D)
+        x1 = x_f * dv_inv_sqrt.unsqueeze(-1)             # (N, D)
 
         # 2. M^T x1  (node -> edge): (E, N) x (N, D) = (E, D)
         edge_feats = M.t() @ x1
@@ -194,7 +196,8 @@ class AdaptiveHypergraph(nn.Module):
         node_feats = M @ edge_feats
 
         # 5. D_v^{-1/2}
-        return node_feats * dv_inv_sqrt.unsqueeze(-1)
+        out = node_feats * dv_inv_sqrt.unsqueeze(-1)
+        return out.to(orig_dtype)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,14 +228,15 @@ class RigidityLoss(nn.Module):
         assignment_0: torch.Tensor,      # (N,) initial assignment (for centroid)
     ) -> torch.Tensor:
         E = membership.shape[1]
-        node_disp = means_t - means_0                    # (N, 3)
+        node_disp = means_t.float() - means_0.float()    # (N, 3)
+        M_f = membership.float()
 
         # Per-cluster centroid displacement (using initial assignment for scatter,
         # so the centroids are stable regardless of current soft membership).
         centroid_disp = _scatter_mean(node_disp, assignment_0, E)  # (E, 3)
 
         # Expected displacement under soft membership: M @ centroid_disp.
-        expected = membership @ centroid_disp             # (N, 3)
+        expected = M_f @ centroid_disp                   # (N, 3)
 
         residual = node_disp - expected                  # (N, 3)
         res = (residual ** 2).sum(dim=-1).mean()
@@ -252,7 +256,8 @@ class TopologySmoothnessLoss(nn.Module):
         super().__init__()
 
     def forward(self, M_t: torch.Tensor, M_prev: torch.Tensor) -> torch.Tensor:
-        res = ((M_t - M_prev) ** 2).sum() / max(1, M_t.shape[0])
+        diff = M_t.float() - M_prev.float()
+        res = (diff ** 2).sum() / max(1, M_t.shape[0])
         return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 

@@ -115,34 +115,23 @@ def points_from_depth(
     return pts_cam @ R.T + t  # (S,3) world
 
 
-def seed_cloud_from_views(
+def _project_and_score_candidates(
+    candidates: torch.Tensor,
     views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    n_gaussians: int,
-    device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Seed 3D points inside the 3D visual hull of the object centered at (0,0,0).
+    """Project 3D candidates (M, 3) into all views and count foreground hits vs background misses."""
+    device = candidates.device
+    n_cand = candidates.shape[0]
+    accum_color = torch.zeros(n_cand, 3, device=device)
+    fg_hits = torch.zeros(n_cand, device=device)
+    bg_misses = torch.zeros(n_cand, device=device)
 
-    Generates candidate 3D points in [-0.45, 0.45]^3 world space, projects them into
-    all t=0 camera views, and selects points that project to foreground pixels across
-    multiple views with initial colors sampled from projected 2D RGB pixels.
-
-    Returns (points (N,3), colors (N,3), initial_opacities (N,1)).
-    """
-    # 1. Generate candidate points in world space [-0.45, 0.45]^3 around origin
-    n_candidates = max(n_gaussians * 3, 100_000)
-    candidates = (torch.rand(n_candidates, 3, device=device) - 0.5) * 0.9  # [-0.45, 0.45]^3
-
-    accum_color = torch.zeros(n_candidates, 3, device=device)
-    hit_count = torch.zeros(n_candidates, device=device)
-
-    # 2. Project candidates into each camera view
     for img, c2w, K in views:
         H, W = img.shape[-2], img.shape[-1]
         w2c = torch.inverse(c2w)
-
         R_w2c = w2c[:3, :3]
         t_w2c = w2c[:3, 3]
-        pts_cam = candidates @ R_w2c.T + t_w2c  # (N, 3)
+        pts_cam = candidates @ R_w2c.T + t_w2c
 
         z = pts_cam[:, 2]
         in_front = z > 0.1
@@ -150,32 +139,93 @@ def seed_cloud_from_views(
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
 
-        u = (fx * pts_cam[:, 0] / z + cx).round().long()
-        v = (fy * pts_cam[:, 1] / z + cy).round().long()
+        u = (fx * pts_cam[:, 0] / z.clamp_min(1e-4) + cx).round().long()
+        v = (fy * pts_cam[:, 1] / z.clamp_min(1e-4) + cy).round().long()
 
         in_bounds = in_front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-
         if not in_bounds.any():
+            bg_misses += 1.0
             continue
+
+        # Any point projecting outside the image frustum of a camera when the
+        # object is centered inside the frame is outside the visual hull.
+        out_idx = torch.where(~in_bounds)[0]
+        if out_idx.numel() > 0:
+            bg_misses.index_add_(
+                0, out_idx, torch.ones_like(out_idx, dtype=torch.float)
+            )
 
         valid_idx = torch.where(in_bounds)[0]
         u_v = u[valid_idx]
         v_v = v[valid_idx]
 
-        pix_colors = img[:, v_v, u_v].t()  # (M, 3)
-        is_fg = (pix_colors < 0.92).any(dim=-1)  # (M,) bool
+        pix_colors = img[:, v_v, u_v].t()  # (M_valid, 3)
+        is_fg = (pix_colors < 0.95).any(dim=-1)
 
         fg_valid_idx = valid_idx[is_fg]
-        fg_pix_colors = pix_colors[is_fg]
+        bg_valid_idx = valid_idx[~is_fg]
 
-        accum_color.index_add_(0, fg_valid_idx, fg_pix_colors)
-        hit_count.index_add_(0, fg_valid_idx, torch.ones_like(fg_valid_idx, dtype=torch.float))
+        if fg_valid_idx.numel() > 0:
+            accum_color.index_add_(0, fg_valid_idx, pix_colors[is_fg])
+            fg_hits.index_add_(
+                0, fg_valid_idx, torch.ones_like(fg_valid_idx, dtype=torch.float)
+            )
+        if bg_valid_idx.numel() > 0:
+            bg_misses.index_add_(
+                0, bg_valid_idx, torch.ones_like(bg_valid_idx, dtype=torch.float)
+            )
 
-    # 3. Select points inside visual hull (hit_count > 0)
-    fg_mask = hit_count > 0
-    if fg_mask.sum() > 100:
-        hull_idx = torch.where(fg_mask)[0]
-        sorted_idx = hull_idx[torch.argsort(hit_count[hull_idx], descending=True)]
+    return accum_color, fg_hits, bg_misses
+
+
+def seed_cloud_from_views(
+    views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    n_gaussians: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Seed 3D points inside the multi-view 3D visual hull in [-1.25, 1.25]^3.
+
+    Uses a two-stage coarse-to-fine silhouette carving pass so full-extent D-NeRF
+    structures (e.g. T-Rex skull, tail tip, and pedestal) are completely covered
+    while empty background space is carved away.
+
+    Returns (points (N,3), colors (N,3), initial_opacities (N,1)).
+    """
+    n_views = len(views)
+    # 1. Coarse pass across the full D-NeRF world volume [-1.25, 1.25]^3
+    n_coarse = max(n_gaussians * 10, 250_000)
+    coarse_pts = (torch.rand(n_coarse, 3, device=device) - 0.5) * 2.5
+
+    accum_c, fg_c, bg_c = _project_and_score_candidates(coarse_pts, views)
+
+    # Strict visual hull: a 3D point inside the object projects to foreground in
+    # nearly all cameras and rarely hits white background.
+    hull_mask = torch.zeros(n_coarse, dtype=torch.bool, device=device)
+    for max_misses in range(0, n_views + 1):
+        min_hits = max(1, n_views - max_misses)
+        cand_mask = (fg_c >= min_hits) & (bg_c <= max_misses)
+        if cand_mask.sum() >= min(n_gaussians // 4, 1500):
+            hull_mask = cand_mask
+            break
+    if not hull_mask.any():
+        hull_mask = fg_c > 0
+
+    if hull_mask.sum() > 32:
+        core_pts = coarse_pts[hull_mask]
+        # 2. Fine densification pass around the carved coarse visual hull
+        n_fine = max(n_gaussians * 6, 120_000)
+        rep = (n_fine // core_pts.shape[0]) + 1
+        fine_base = core_pts.repeat(rep, 1)[:n_fine]
+        fine_pts = (fine_base + torch.randn_like(fine_base) * 0.03).clamp(-1.35, 1.35)
+
+        all_pts = torch.cat([core_pts, fine_pts], dim=0)
+        accum_color, fg_hits, bg_misses = _project_and_score_candidates(all_pts, views)
+
+        # Score points by foreground consistency (fg_hits - 2 * bg_misses)
+        score = fg_hits - 2.0 * bg_misses
+        valid_hull = fg_hits > 0
+        hull_idx = torch.where(valid_hull)[0]
+        sorted_idx = hull_idx[torch.argsort(score[hull_idx], descending=True)]
 
         if len(sorted_idx) >= n_gaussians:
             sel_idx = sorted_idx[:n_gaussians]
@@ -183,9 +233,9 @@ def seed_cloud_from_views(
             repeat_cnt = (n_gaussians // len(sorted_idx)) + 1
             sel_idx = sorted_idx.repeat(repeat_cnt)[:n_gaussians]
 
-        selected_pts = candidates[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.005
-        selected_colors = accum_color[sel_idx] / hit_count[sel_idx].unsqueeze(-1).clamp_min(1.0)
-        selected_opacities = torch.full((n_gaussians, 1), 0.5, device=device)
+        selected_pts = all_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.003
+        selected_colors = accum_color[sel_idx] / fg_hits[sel_idx].unsqueeze(-1).clamp_min(1.0)
+        selected_opacities = torch.full((n_gaussians, 1), 0.2, device=device)
         return selected_pts, selected_colors, selected_opacities
     else:
         pts = torch.randn(n_gaussians, 3, device=device) * 0.35
@@ -232,12 +282,25 @@ class StaticGSInit:
         # Move views to device using hardware-adaptive resolution.
         render_wh = cfg.auto_render_wh() if dev == "cuda" else cfg.data.render_wh
         rH, rW = render_wh[1], render_wh[0]
-        views = [
-            (F.interpolate(img.unsqueeze(0), size=(rH, rW), mode="bilinear",
-                           align_corners=False).squeeze(0).to(dev),
-             c2w.to(dev), K.to(dev))
-            for img, c2w, K in views
-        ]
+        scaled_views = []
+        for img, c2w, K in views:
+            img_d = F.interpolate(
+                img.unsqueeze(0), size=(rH, rW), mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).to(dev)
+            K_d = K.clone().to(dev)
+            # Ensure intrinsics principal point (cx, cy) and focal length match (rW, rH)
+            orig_w = float(K_d[0, 2].item() * 2.0 + 1.0)
+            orig_h = float(K_d[1, 2].item() * 2.0 + 1.0)
+            if abs(orig_w - rW) > 2.0 and orig_w > 0 and orig_h > 0:
+                sx = rW / orig_w
+                sy = rH / orig_h
+                K_d[0, 0] *= sx
+                K_d[1, 1] *= sy
+                K_d[0, 2] = 0.5 * (rW - 1.0)
+                K_d[1, 2] = 0.5 * (rH - 1.0)
+            scaled_views.append((img_d, c2w.to(dev), K_d))
+        views = scaled_views
         H, W = views[0][0].shape[-2], views[0][0].shape[-1]
 
         # Seed points & colors from 3D visual hull projection
@@ -258,7 +321,7 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-7.5, -4.2)
+            cloud.scales.data.clamp_(-6.0, -4.2)
 
         # Parameter groups with per-attribute learning rates (3DGS convention).
         lr_means_init = cfg.static_gs.lr_means * 1.5
@@ -297,9 +360,12 @@ class StaticGSInit:
                 out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
-                loss = self.loss_fn(pred, tgt)
+                photo_loss = self.loss_fn(pred, tgt)
+                # Mild opacity sparsity regularization to clear background floaters
+                op_reg = 2e-4 * torch.sigmoid(cloud.opacities).mean()
+                loss = photo_loss + op_reg
                 (loss / n_views).backward()
-                total = total + float(loss.item())
+                total = total + float(photo_loss.item())
             total = total / n_views
             opt.step()
             sched.step()
@@ -308,23 +374,23 @@ class StaticGSInit:
             with torch.no_grad():
                 cloud.scales.data.clamp_(-7.0, -3.2)
                 cloud.sh.data.clamp_(0.0, 1.0)
-                cloud.opacities.data.clamp_(-3.5, 4.0)
+                cloud.opacities.data.clamp_(-8.0, 5.0)
 
             history.append(float(total))
             if (it + 1) % max(1, iters // 10) == 0:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
                       f"loss={total:.5f}")
 
-        # Conservative opacity pruning (opacity logit < -3.5 -> opacity < 0.029)
+        # Prune transparent floaters (logit <= -2.2 -> opacity <= 0.10)
         with torch.no_grad():
-            valid_mask = (cloud.opacities.squeeze(-1) > -3.5)
+            valid_mask = (cloud.opacities.squeeze(-1) > -2.2)
             if valid_mask.sum() > 500:  # Retain active visual hull cloud
                 cloud = GaussianCloud(
                     means=cloud.means[valid_mask],
                     scales=cloud.scales[valid_mask],
                     rotations=cloud.rotations[valid_mask],
                     opacities=cloud.opacities[valid_mask],
-                    sh=cloud.sh[valid_mask],
+                    sh=cloud.sh.data[valid_mask],
                 )
 
         # Detach the final substrate; MCRAH does not train it.

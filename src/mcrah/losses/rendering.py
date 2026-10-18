@@ -52,17 +52,21 @@ class L1SSIMLoss(nn.Module):
         return win.expand(c, 1, self.window_size, self.window_size).contiguous()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # pred,target: (B,3,H,W) in [0,1]
-        l1 = F.l1_loss(pred, target)
-        win = self._channel_window(pred.shape[1], pred.device, pred.dtype)
-        ssim_map = _ssim_map(pred, target, win, self.c1, self.c2)
+        # pred,target: (B,3,H,W) in [0,1]. Compute in float32 for AMP stability.
+        pred_f = pred.float()
+        target_f = target.float()
+        l1 = F.l1_loss(pred_f, target_f)
+        win = self._channel_window(pred_f.shape[1], pred_f.device, torch.float32)
+        ssim_map = _ssim_map(pred_f, target_f, win, self.c1, self.c2)
         ssim_loss = 1.0 - ssim_map.mean()
         return self.w_l1 * l1 + self.w_ssim * ssim_loss
 
     @torch.no_grad()
     def ssim_value(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        win = self._channel_window(pred.shape[1], pred.device, pred.dtype)
-        return _ssim_map(pred, target, win, self.c1, self.c2).mean()
+        pred_f = pred.float()
+        target_f = target.float()
+        win = self._channel_window(pred_f.shape[1], pred_f.device, torch.float32)
+        return _ssim_map(pred_f, target_f, win, self.c1, self.c2).mean()
 
 
 # Standard NVS metrics (Phase 4 Step 10).

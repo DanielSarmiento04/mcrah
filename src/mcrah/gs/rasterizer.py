@@ -426,7 +426,9 @@ class CUDAGaussianRasterizer(Rasterizer):
             )
 
             means3D = g.means.contiguous().float()
-            means2D = torch.zeros_like(means3D, dtype=torch.float32)
+            means2D = torch.zeros_like(
+                means3D, dtype=torch.float32, requires_grad=means3D.requires_grad
+            )
             opacity = g.opacities.contiguous().float()
             colors = g.sh.contiguous().float()              # (N,3) DC RGB
             scales = g.scales.contiguous().float()          # (N, 3) activated

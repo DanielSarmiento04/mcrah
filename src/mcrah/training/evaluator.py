@@ -95,17 +95,27 @@ class Evaluator:
             by_time.setdefault(key, []).append(s)
         times = sorted(by_time.keys(), key=lambda k: k[1])
 
+        cur_cloud = model.cloud
         for key in times[:max_samples] if max_samples else times:
             window = by_time[key][:1]  # one view per time step for metrics
             t = torch.tensor(window[0].time, device=dev)
-            step = model.step(model.cloud, t)
+            step = model.step(cur_cloud, t)
+            cur_cloud = step.cloud
             s = window[0]
             # Render at hardware-adaptive resolution (auto_render_wh() on CUDA); resample
             # target to match so PSNR/SSIM/LPIPS are computed at a consistent scale.
             render_wh = self.cfg.auto_render_wh() if dev == "cuda" else self.cfg.data.render_wh
             H, W = render_wh[1], render_wh[0]
             bg = torch.ones(3, device=dev) if self.cfg.data.white_background else None
-            out = render(step.cloud, s.c2w.to(dev), s.intrinsics.to(dev),
+            K = s.intrinsics.clone().to(dev)
+            orig_w = float(K[0, 2].item() * 2.0 + 1.0)
+            orig_h = float(K[1, 2].item() * 2.0 + 1.0)
+            if abs(orig_w - W) > 2.0 and orig_w > 0 and orig_h > 0:
+                K[0, 0] *= W / orig_w
+                K[1, 1] *= H / orig_h
+                K[0, 2] = 0.5 * (W - 1.0)
+                K[1, 2] = 0.5 * (H - 1.0)
+            out = render(step.cloud, s.c2w.to(dev), K,
                         width=W, height=H, bg_color=bg)
             pred = out.image.unsqueeze(0).clamp(0, 1)  # (1,3,H,W)
             tgt = s.image.to(dev).unsqueeze(0)         # (1,3,H0,W0)

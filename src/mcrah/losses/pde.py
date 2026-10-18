@@ -30,11 +30,18 @@ class RelativeL2Loss(nn.Module):
         self.eps = eps
 
     def forward(self, delta: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        # Match trailing dims: state may be (N,3), delta (N,3).
-        if delta.shape != state.shape:
-            state = state.expand_as(delta)
-        num = (delta ** 2).sum(dim=-1, keepdim=True)
-        den = ((state ** 2).sum(dim=-1, keepdim=True) + self.eps).clamp_min(1e-5)
+        # Compute in float32 so FP16 autocast + GradScaler (scale=65536) never
+        # overflows or produces 0 * Inf = NaN gradients.
+        delta_f = delta.float()
+        state_f = state.float()
+        if delta_f.shape != state_f.shape:
+            state_f = state_f.expand_as(delta_f)
+        num = (delta_f ** 2).sum(dim=-1, keepdim=True)
+        # Anchor the denominator to both per-point norm and mean scene extent so
+        # Gaussians near the coordinate origin (0,0,0) do not get a 10^5x penalty.
+        point_norm2 = (state_f ** 2).sum(dim=-1, keepdim=True)
+        scene_norm2 = point_norm2.mean().clamp_min(1e-2)
+        den = (point_norm2 + scene_norm2 + self.eps).clamp_min(1e-2)
         res = (num / den).mean()
         return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -93,7 +100,8 @@ class PDERegularizer(nn.Module):
     def forward(self, offsets: torch.Tensor) -> torch.Tensor:
         # offsets: (T, N, D) autoregressive predictions over T timesteps.
         if offsets.shape[0] < 3:
-            return offsets.new_zeros(())
-        d2 = offsets[2:] - 2 * offsets[1:-1] + offsets[:-2]  # (T-2,N,D)
+            return offsets.new_zeros((), dtype=torch.float32)
+        offsets_f = offsets.float()
+        d2 = offsets_f[2:] - 2.0 * offsets_f[1:-1] + offsets_f[:-2]  # (T-2,N,D)
         res = self.lam * (d2 ** 2).mean()
         return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
