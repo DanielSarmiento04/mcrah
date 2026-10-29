@@ -160,7 +160,9 @@ def _project_and_score_candidates(
         v_v = v[valid_idx]
 
         pix_colors = img[:, v_v, u_v].t()  # (M_valid, 3)
-        is_fg = (pix_colors < 0.95).any(dim=-1)
+        # Use 0.985 threshold so bright white/ivory bone (skull, ribs, tail tip)
+        # against the 1.0 white background is counted as foreground, not background.
+        is_fg = (pix_colors < 0.985).any(dim=-1)
 
         fg_valid_idx = valid_idx[is_fg]
         bg_valid_idx = valid_idx[~is_fg]
@@ -178,78 +180,140 @@ def _project_and_score_candidates(
     return accum_color, fg_hits, bg_misses
 
 
+def _carve_rays_from_pixels(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    c2w: torch.Tensor,
+    K: torch.Tensor,
+    views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    n_depths: int = 48,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """March 3D candidates along camera rays through (u, v) and pick the depth
+    that maximizes multi-view silhouette consistency across all ``views``.
+
+    Returns (best_pts (R,3), best_colors (R,3), best_scores (R,)).
+    """
+    device = c2w.device
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    dirs_cam = torch.stack(
+        [(u.float() - cx) / fx, (v.float() - cy) / fy, torch.ones_like(u, dtype=torch.float)],
+        dim=-1,
+    )
+    R = c2w[:3, :3]
+    t = c2w[:3, 3]
+    dirs_w = dirs_cam @ R.T  # (R_rays, 3)
+    cam_dist = float(t.norm().item())
+    if cam_dist < 0.5:
+        cam_dist = 4.0
+    z_min = max(0.2, cam_dist - 1.30)
+    z_max = cam_dist + 1.30
+    z_vals = torch.linspace(z_min, z_max, n_depths, device=device)
+
+    # Candidate 3D points along each ray: (R_rays, n_depths, 3)
+    pts_ray = t.view(1, 1, 3) + dirs_w.unsqueeze(1) * z_vals.view(1, n_depths, 1)
+    flat_pts = pts_ray.reshape(-1, 3)
+    accum_c, fg_c, bg_c = _project_and_score_candidates(flat_pts, views)
+
+    scores = (fg_c - 0.35 * bg_c).reshape(-1, n_depths)
+    best_d = scores.argmax(dim=1)
+    ray_idx = torch.arange(scores.shape[0], device=device)
+    best_scores = scores[ray_idx, best_d]
+    best_pts = pts_ray[ray_idx, best_d]
+
+    flat_idx = ray_idx * n_depths + best_d
+    best_colors = accum_c[flat_idx] / fg_c[flat_idx].unsqueeze(-1).clamp_min(1.0)
+    return best_pts, best_colors, best_scores
+
+
 def seed_cloud_from_views(
     views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     n_gaussians: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Seed 3D points inside the multi-view 3D visual hull in [-1.25, 1.25]^3.
+    """Seed 3D points via Multi-View Foreground Ray-Carving + Edge/Bone Importance Sampling.
 
-    Uses a two-stage coarse-to-fine silhouette carving pass so full-extent D-NeRF
-    structures (e.g. T-Rex skull, tail tip, and pedestal) are completely covered
-    while empty background space is carved away.
+    Unlike uniform 3D cube sampling (which places >95% of points inside the thick
+    solid pedestal and starves thin 1D/2D structures like the T-Rex tail tip,
+    ribs, and skull), ray-carving shoots rays directly through every 2D foreground
+    pixel (weighted toward high-contrast bone edges and bright bone details) and
+    places each 3D Gaussian at the exact depth along the ray that maximizes
+    multi-view silhouette consistency.
 
     Returns (points (N,3), colors (N,3), initial_opacities (N,1)).
     """
-    n_views = len(views)
-    # 1. Coarse pass across the full D-NeRF world volume [-1.25, 1.25]^3
-    n_coarse = max(n_gaussians * 12, 300_000)
-    coarse_pts = (torch.rand(n_coarse, 3, device=device) - 0.5) * 2.5
+    n_views = max(1, len(views))
+    rays_per_view = max(64, (n_gaussians * 2) // n_views)
 
-    accum_c, fg_c, bg_c = _project_and_score_candidates(coarse_pts, views)
+    ray_pts_list: List[torch.Tensor] = []
+    ray_col_list: List[torch.Tensor] = []
+    ray_scr_list: List[torch.Tensor] = []
 
-    # Multi-view silhouette carving: include both thick stationary regions (high
-    # fg_c) and thin/articulated extremities like the tail tip and jaw (which hit
-    # foreground in >= 45% of early cameras) so the coarse hull covers 100% of the anatomy.
-    min_target_core = min(max(n_gaussians // 2, 5000), n_coarse // 4)
-    hull_mask = torch.zeros(n_coarse, dtype=torch.bool, device=device)
-    start_misses = max(1, int(n_views * 0.35))
-    for max_misses in range(start_misses, n_views + 1):
-        min_hits = max(1, n_views - max_misses)
-        cand_mask = (fg_c >= min_hits) & (bg_c <= max_misses)
-        if cand_mask.sum() >= min_target_core:
-            hull_mask = cand_mask
-            break
-    if not hull_mask.any():
-        hull_mask = fg_c >= max(1, n_views // 3)
-    if not hull_mask.any():
-        hull_mask = fg_c > 0
+    for img, c2w, K in views:
+        H, W = img.shape[-2], img.shape[-1]
+        fg_mask = (img < 0.985).any(dim=0)
+        ys, xs = torch.where(fg_mask)
+        if ys.numel() < 16:
+            continue
 
-    if hull_mask.sum() > 32:
-        core_pts = coarse_pts[hull_mask]
-        # 2. Fine densification pass around the full-anatomy coarse visual hull
-        n_fine = max(n_gaussians * 6, 120_000)
-        rep = (n_fine // core_pts.shape[0]) + 1
-        fine_base = core_pts.repeat(rep, 1)[:n_fine]
-        fine_pts = (fine_base + torch.randn_like(fine_base) * 0.025).clamp(-1.35, 1.35)
+        # Compute 2D spatial gradient + bone brightness weight so thin ribs,
+        # tail vertebrae, and skull edges receive 3x higher ray density than
+        # flat interior pedestal regions.
+        grad_x = torch.zeros(H, W, device=device)
+        grad_y = torch.zeros(H, W, device=device)
+        grad_x[:, :-1] = (img[:, :, 1:] - img[:, :, :-1]).abs().mean(dim=0)
+        grad_y[:-1, :] = (img[:, 1:, :] - img[:, :-1, :]).abs().mean(dim=0)
+        edge_mag = (grad_x + grad_y)[ys, xs]
+        pix_lum = img[:, ys, xs].mean(dim=0)
+        # Bright bone pixels (lum > 0.55) and high-edge pixels get higher weight
+        weights = 1.0 + 6.0 * edge_mag + 1.5 * (pix_lum > 0.55).float()
 
-        all_pts = torch.cat([core_pts, fine_pts], dim=0)
-        accum_color, fg_hits, bg_misses = _project_and_score_candidates(all_pts, views)
+        n_sample = min(rays_per_view, ys.numel())
+        sampled_idx = torch.multinomial(weights, n_sample, replacement=(ys.numel() < n_sample))
+        u_s = xs[sampled_idx]
+        v_s = ys[sampled_idx]
 
-        # Balanced silhouette score that preserves thin high-detail bone extremities
-        score = fg_hits - 0.5 * bg_misses
-        min_valid_hits = max(1, int(n_views * 0.35)) if n_views >= 4 else 1
-        valid_hull = fg_hits >= min_valid_hits
-        if valid_hull.sum() < n_gaussians // 2:
-            valid_hull = fg_hits > 0
-        hull_idx = torch.where(valid_hull)[0]
-        sorted_idx = hull_idx[torch.argsort(score[hull_idx], descending=True)]
+        b_pts, b_cols, b_scr = _carve_rays_from_pixels(u_s, v_s, c2w, K, views, n_depths=48)
+        # Blend view pixel color with multi-view average for crisp initialization
+        view_cols = img[:, v_s, u_s].t()
+        b_cols = 0.6 * view_cols + 0.4 * b_cols
+        ray_pts_list.append(b_pts)
+        ray_col_list.append(b_cols)
+        ray_scr_list.append(b_scr)
 
-        if len(sorted_idx) >= n_gaussians:
-            sel_idx = sorted_idx[:n_gaussians]
+    if ray_pts_list:
+        all_pts = torch.cat(ray_pts_list, dim=0)
+        all_cols = torch.cat(ray_col_list, dim=0)
+        all_scr = torch.cat(ray_scr_list, dim=0)
+
+        min_valid_score = max(0.5, n_views * 0.20) if n_views >= 4 else -10.0
+        valid_mask = all_scr >= min_valid_score
+        if valid_mask.sum() < max(32, n_gaussians // 4):
+            valid_mask = torch.ones_like(all_scr, dtype=torch.bool)
+
+        valid_pts = all_pts[valid_mask]
+        valid_cols = all_cols[valid_mask]
+        valid_scr = all_scr[valid_mask]
+
+        # Keep a balanced mix across all views/regions rather than only top-score
+        # pedestal points: filter to valid multi-view hull, then sample with
+        # mild preference for higher consistency.
+        if valid_pts.shape[0] >= n_gaussians:
+            probs = (valid_scr - valid_scr.min() + 1.0).clamp_min(0.1)
+            sel_idx = torch.multinomial(probs, n_gaussians, replacement=False)
         else:
-            repeat_cnt = (n_gaussians // len(sorted_idx)) + 1
-            sel_idx = sorted_idx.repeat(repeat_cnt)[:n_gaussians]
+            repeat_cnt = (n_gaussians // valid_pts.shape[0]) + 1
+            sel_idx = torch.arange(valid_pts.shape[0], device=device).repeat(repeat_cnt)[:n_gaussians]
 
-        selected_pts = all_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.002
-        selected_colors = accum_color[sel_idx] / fg_hits[sel_idx].unsqueeze(-1).clamp_min(1.0)
-        selected_opacities = torch.full((n_gaussians, 1), 0.5, device=device)
+        selected_pts = valid_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.0015
+        selected_colors = valid_cols[sel_idx].clamp(0.0, 1.0)
+        selected_opacities = torch.full((n_gaussians, 1), 0.8, device=device)
         return selected_pts, selected_colors, selected_opacities
-    else:
-        pts = torch.randn(n_gaussians, 3, device=device) * 0.35
-        colors = torch.full((n_gaussians, 3), 0.3, device=device)
-        opacities = torch.zeros(n_gaussians, 1, device=device)
-        return pts, colors, opacities
+
+    pts = torch.randn(n_gaussians, 3, device=device) * 0.35
+    colors = torch.full((n_gaussians, 3), 0.3, device=device)
+    opacities = torch.zeros(n_gaussians, 1, device=device)
+    return pts, colors, opacities
 
 
 class StaticGSInit:
@@ -329,15 +393,18 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            cloud.scales.data.clamp_(-6.0, -4.2)
+            # Start at -4.85 (exp(-4.85) ~ 0.0078, ~3px radius) well below the
+            # -4.20 (0.015) ceiling so splats resolve fine ribs and vertebrae.
+            cloud.scales.data.clamp_(-6.0, -4.75)
 
-        # Parameter groups with per-attribute learning rates (3DGS convention).
-        lr_means_init = cfg.static_gs.lr_means * 1.5
+        # Parameter groups with per-attribute learning rates (3DGS convention,
+        # scaled by D-NeRF camera radius ~3.5x).
+        lr_means_init = cfg.static_gs.lr_means * 3.5
         params = [
             {"params": [cloud.means], "lr": lr_means_init},
             {"params": [cloud.scales], "lr": cfg.static_gs.lr_scales},
             {"params": [cloud.opacities], "lr": cfg.static_gs.lr_opacity},
-            {"params": [cloud.sh], "lr": 3.5e-3},
+            {"params": [cloud.sh], "lr": 4.0e-3},
         ]
         if cfg.model.predict_rotation:
             params.append(
@@ -345,9 +412,9 @@ class StaticGSInit:
         opt = torch.optim.Adam(params, lr=cfg.static_gs.lr_means)
 
         # Decoupled 3DGS schedules:
-        # means & rotations: exponential decay from lr_init to lr_final (0.01x)
+        # means & rotations: exponential decay from lr_init to lr_final (0.02x)
         # scales, opacities, sh: sustained cosine decay down to 20% of initial lr
-        gamma_means = (0.01) ** (1.0 / max(1, iters))
+        gamma_means = (0.02) ** (1.0 / max(1, iters))
         sched_funcs = [
             lambda step: gamma_means ** step,                            # means
             lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # scales
@@ -361,6 +428,8 @@ class StaticGSInit:
         history: List[float] = []
         bg = torch.ones(3, device=dev) if cfg.data.white_background else None
         n_views = max(1, len(views))
+        recycle_steps = {int(iters * 0.30), int(iters * 0.60)} if iters >= 200 else set()
+
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
@@ -371,7 +440,7 @@ class StaticGSInit:
                 photo_loss = self.loss_fn(pred, tgt)
                 # Gentle opacity sparsity regularization to clear empty-space floaters
                 # without erasing thin white bone structures (ribs/tail tip).
-                op_reg = 4e-5 * torch.sigmoid(cloud.opacities).mean()
+                op_reg = 3e-5 * torch.sigmoid(cloud.opacities).mean()
                 loss = photo_loss + op_reg
                 (loss / n_views).backward()
                 total = total + float(photo_loss.item())
@@ -379,20 +448,23 @@ class StaticGSInit:
             opt.step()
             sched.step()
 
-            # Keep parameters physically bounded during optimization
+            # Keep parameters physically bounded during optimization (strictly
+            # below -4.22 so scales never enter the 0.015 clamp ceiling).
             with torch.no_grad():
-                cloud.scales.data.clamp_(-7.0, -3.2)
+                cloud.scales.data.clamp_(-7.5, -4.22)
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-8.0, 5.0)
+                if (it + 1) in recycle_steps and cloud.n >= 500:
+                    self._recycle_transparent_to_high_error(cloud, views, W, H, bg)
 
             history.append(float(total))
             if (it + 1) % max(1, iters // 10) == 0:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
                       f"loss={total:.5f}")
 
-        # Prune transparent floaters (logit <= -3.2 -> opacity <= 0.039)
+        # Prune only genuinely invisible floaters (logit <= -3.5 -> opacity <= 0.029)
         with torch.no_grad():
-            valid_mask = (cloud.opacities.squeeze(-1) > -3.2)
+            valid_mask = (cloud.opacities.squeeze(-1) > -3.5)
             if valid_mask.sum() > 500:  # Retain active visual hull cloud
                 cloud = GaussianCloud(
                     means=cloud.means[valid_mask],
@@ -411,6 +483,53 @@ class StaticGSInit:
             sh=cloud.sh.detach().clone(),
         )
         return StaticInitResult(cloud=final, history=history, iterations=iters)
+
+    @torch.no_grad()
+    def _recycle_transparent_to_high_error(
+        self,
+        cloud: GaussianCloud,
+        views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        W: int,
+        H: int,
+        bg: Optional[torch.Tensor],
+    ) -> None:
+        """Teleport transparent Gaussians (logit < -1.8) directly onto the
+        highest-photometric-error foreground pixels via multi-view ray-carving."""
+        dead_idx = torch.where(cloud.opacities.squeeze(-1) < -1.8)[0]
+        if dead_idx.numel() < 16:
+            return
+        n_recycle = min(int(dead_idx.numel()), max(64, cloud.n // 4))
+        dead_idx = dead_idx[:n_recycle]
+        per_view = max(8, (n_recycle // max(1, len(views))) + 4)
+
+        new_pts_list: List[torch.Tensor] = []
+        new_col_list: List[torch.Tensor] = []
+        for img, c2w, K in views:
+            out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
+            err = (out.image - img).abs().mean(dim=0)  # (H, W)
+            fg_mask = (img < 0.985).any(dim=0)
+            ys, xs = torch.where(fg_mask & (err > 0.02))
+            if ys.numel() < 8:
+                continue
+            weights = (err[ys, xs] ** 2).clamp_min(1e-6)
+            k = min(per_view, ys.numel())
+            sel = torch.multinomial(weights, k, replacement=False)
+            u_s, v_s = xs[sel], ys[sel]
+            b_pts, b_cols, _ = _carve_rays_from_pixels(u_s, v_s, c2w, K, views, n_depths=48)
+            view_cols = img[:, v_s, u_s].t()
+            new_pts_list.append(b_pts)
+            new_col_list.append(0.7 * view_cols + 0.3 * b_cols)
+
+        if not new_pts_list:
+            return
+        new_pts = torch.cat(new_pts_list, dim=0)
+        new_cols = torch.cat(new_col_list, dim=0)
+        count = min(dead_idx.numel(), new_pts.shape[0])
+        target_idx = dead_idx[:count]
+        cloud.means.data[target_idx] = new_pts[:count] + torch.randn_like(new_pts[:count]) * 0.001
+        cloud.sh.data[target_idx] = new_cols[:count].clamp(0.0, 1.0)
+        cloud.opacities.data[target_idx] = 0.6
+        cloud.scales.data[target_idx] = -5.15
 
 
 def save_cloud(cloud: GaussianCloud, path: Path | str) -> None:

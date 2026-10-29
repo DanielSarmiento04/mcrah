@@ -93,18 +93,19 @@ class MCRAHGate(nn.Module):
         # Cluster centroids at current time (using initial assignment for scatter).
         centroid_t = _scatter_mean(means_t, assignment_0, E)  # (E, 3)
 
-        # Node displacement + reference position.
-        node_disp = means_t - means_0                     # (N, 3)
+        # Node displacement + reference position (bounded for rollout stability).
+        node_disp = torch.tanh((means_t - means_0) * 5.0) * 0.2  # (N, 3)
         node_feat = self.node_enc(
             torch.cat([node_disp, means_0], dim=-1))       # (N, D)
 
         # Cluster displacement + reference centroid.
-        cluster_disp = centroid_t - centroid_0             # (E, 3)
+        cluster_disp = torch.tanh((centroid_t - centroid_0) * 5.0) * 0.2  # (E, 3)
         cluster_feat = self.cluster_enc(
             torch.cat([cluster_disp, centroid_0], dim=-1)) # (E, D)
 
-        # Compatibility: dot product (N, E) performed in float32 for AMP stability.
-        logits = (node_feat.float() @ cluster_feat.float().t()) / max(1e-4, float(self.tau))
+        # Compatibility: scaled dot product (N, E) performed in float32 for AMP stability.
+        scale = max(1e-4, float(self.tau) * (self.feat_dim ** 0.5))
+        logits = (node_feat.float() @ cluster_feat.float().t()) / scale
 
         # Prior bias: strong logit for the initial assignment, negative for others.
         mask_0 = F.one_hot(

@@ -80,6 +80,15 @@ class FeatureEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(feat_dim, feat_dim),
         )
+        # Multiplicative FiLM temporal modulation so spatial Fourier features
+        # interact multiplicatively with time (crucial for articulated parts).
+        self.time_gamma = nn.Sequential(
+            nn.Linear(self.time_encoder.out_dim, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+        nn.init.zeros_(self.time_gamma[-1].weight)
+        nn.init.zeros_(self.time_gamma[-1].bias)
         # Smooth displacement encoder for autoregressive state (means_t - means_0).
         # Avoids feeding deformed positions into high-frequency sin(32*pi*x) bands
         # which caused period-2 Nyquist phase flips during rollout.
@@ -108,10 +117,10 @@ class FeatureEncoder(nn.Module):
         h = self.proj(raw)
         cid = cluster_id.clamp(0, self.cluster_emb.num_embeddings - 1)
         h = h + self.cluster_emb(cid)
-        h = h + self.time_mlp(time_feat)
+        h = h * (1.0 + self.time_gamma(time_feat)) + self.time_mlp(time_feat)
         if ref_means is not None:
-            disp = cloud.means - ref_means
-            h = h + self.disp_mlp(disp)
+            disp = (cloud.means - ref_means).detach()
+            h = h + 0.05 * torch.tanh(self.disp_mlp(disp))
         return h
 
 

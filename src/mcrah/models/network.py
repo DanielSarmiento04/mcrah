@@ -150,12 +150,12 @@ class MCRAH(nn.Module):
         if self.dilated is not None:
             h = self.dhgc(h, self.dilated.to(dev))
         delta_pos, delta_rot = self.simgnn.heads(h)
-        # Smooth autoregressive temporal inertia: blend with previous step's
-        # displacement when stepping from an already-deformed state to prevent
-        # high-frequency period-2 oscillation during long rollouts.
-        prev_disp = cloud.means - self._cloud_means
-        if prev_disp.detach().abs().max() > 1e-7:
-            delta_pos = 0.65 * delta_pos + 0.35 * prev_disp
+        # Smooth autoregressive temporal inertia: lightly blend with previous
+        # step's detached displacement (0.90/0.10) to damp high-frequency ripples
+        # without introducing motion lag or positive-feedback drift across rollout steps.
+        prev_disp = (cloud.means - self._cloud_means).detach()
+        if prev_disp.abs().max() > 1e-7:
+            delta_pos = 0.90 * delta_pos + 0.10 * prev_disp
         new_cloud = apply_offsets(self.cloud, delta_pos, delta_rot)
         return RolloutStep(cloud=new_cloud, delta_pos=delta_pos,
                           delta_rot=delta_rot, membership=membership)
@@ -205,13 +205,17 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical 3D geometry & appearance to fine-tune
-        # across all 200 multi-view training cameras (overcoming the 13-view static init).
+        # In joint stage, allow canonical scales & appearance (SH, opacities, scales)
+        # to sharpen across all 200 multi-view training cameras while keeping
+        # canonical 3D positions (_cloud_means) anchored so moving bones never
+        # smear into a time-averaged blur.
         is_joint = (stage == "joint")
-        for attr in ("_cloud_means", "_cloud_scales", "_cloud_rotations",
-                     "_cloud_sh", "_cloud_opacities"):
+        for attr in ("_cloud_scales", "_cloud_sh", "_cloud_opacities"):
             if hasattr(self, attr):
                 getattr(self, attr).requires_grad = is_joint
+        for attr in ("_cloud_means", "_cloud_rotations"):
+            if hasattr(self, attr):
+                getattr(self, attr).requires_grad = False
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
