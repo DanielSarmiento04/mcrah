@@ -205,17 +205,14 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical scales & appearance (SH, opacities, scales)
-        # to sharpen across all 200 multi-view training cameras while keeping
-        # canonical 3D positions (_cloud_means) anchored so moving bones never
-        # smear into a time-averaged blur.
+        # In joint stage, allow canonical geometry & appearance to fine-tune across
+        # all 200 multi-view training cameras (with precision-capped LR on means/rot
+        # in the trainer so moving bones do not smear while side views align tightly).
         is_joint = (stage == "joint")
-        for attr in ("_cloud_scales", "_cloud_sh", "_cloud_opacities"):
+        for attr in ("_cloud_means", "_cloud_rotations",
+                     "_cloud_scales", "_cloud_sh", "_cloud_opacities"):
             if hasattr(self, attr):
                 getattr(self, attr).requires_grad = is_joint
-        for attr in ("_cloud_means", "_cloud_rotations"):
-            if hasattr(self, attr):
-                getattr(self, attr).requires_grad = False
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

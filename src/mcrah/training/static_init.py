@@ -215,7 +215,7 @@ def _carve_rays_from_pixels(
     flat_pts = pts_ray.reshape(-1, 3)
     accum_c, fg_c, bg_c = _project_and_score_candidates(flat_pts, views)
 
-    scores = (fg_c - 0.35 * bg_c).reshape(-1, n_depths)
+    scores = (fg_c - 0.55 * bg_c).reshape(-1, n_depths)
     best_d = scores.argmax(dim=1)
     ray_idx = torch.arange(scores.shape[0], device=device)
     best_scores = scores[ray_idx, best_d]
@@ -438,9 +438,13 @@ class StaticGSInit:
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 photo_loss = self.loss_fn(pred, tgt)
-                # Gentle opacity sparsity regularization to clear empty-space floaters
-                # without erasing thin white bone structures (ribs/tail tip).
-                op_reg = 3e-5 * torch.sigmoid(cloud.opacities).mean()
+                # Gentle opacity sparsity regularization during the first 70% of
+                # static init to clear floaters, then 0 so solid surfaces (stone
+                # pedestal and white bone) reach full opacity without background bleed.
+                if it < int(iters * 0.70):
+                    op_reg = 2.5e-5 * torch.sigmoid(cloud.opacities).mean()
+                else:
+                    op_reg = 0.0
                 loss = photo_loss + op_reg
                 (loss / n_views).backward()
                 total = total + float(photo_loss.item())

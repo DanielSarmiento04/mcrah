@@ -166,8 +166,10 @@ class MCRAHTrainer:
                 "params": net_params, "lr": lr, "weight_decay": cfg.train.weight_decay
             })
         if cloud_pos_params:
+            # Gentle precision-capped LR (<= 4e-5) so multi-view side cameras align
+            # 3D geometry without smearing dynamic bones into a temporal average.
             param_groups.append({
-                "params": cloud_pos_params, "lr": min(lr, 1.6e-4), "weight_decay": 0.0
+                "params": cloud_pos_params, "lr": min(lr * 0.2, 4e-5), "weight_decay": 0.0
             })
         if cloud_scale_params:
             param_groups.append({
@@ -227,8 +229,17 @@ class MCRAHTrainer:
         if len(times) <= tw:
             window = times
         else:
-            start = torch.randint(0, len(times) - tw + 1, (1,)).item()
-            window = times[start:start + tw]
+            # Mix fine contiguous rollouts (stride=1) with multi-view strided
+            # rollouts (stride in 2..8) so autoregressive steps span real camera
+            # baseline changes and match evaluation step intervals.
+            max_stride = max(1, min(8, (len(times) - 1) // max(1, tw - 1)))
+            if max_stride > 1 and float(torch.rand(1).item()) < 0.5:
+                stride = int(torch.randint(2, max_stride + 1, (1,)).item())
+            else:
+                stride = 1
+            span = (tw - 1) * stride + 1
+            start = int(torch.randint(0, max(1, len(times) - span + 1), (1,)).item())
+            window = times[start:start + span:stride][:tw]
         # Pick a random representative view per time step for multi-view consistency.
         window_samples = []
         for t in window:
@@ -411,6 +422,12 @@ class MCRAHTrainer:
                 self.model._cloud_scales.data.clamp_(-7.5, -4.22)
                 self.model._cloud_sh.data.clamp_(0.0, 1.0)
                 self.model._cloud_opacities.data.clamp_(-8.0, 5.0)
+                q = self.model._cloud_rotations.data
+                self.model._cloud_rotations.data.copy_(
+                    q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                )
+                if self.model.mcrah is not None:
+                    self.model.mcrah.means_0.copy_(self.model._cloud_means.detach())
         if self._scheduler is not None and step_successful:
             self._scheduler.step()
         metrics["lr"] = float(self._opt.param_groups[0]["lr"])

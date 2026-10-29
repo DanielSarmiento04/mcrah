@@ -35,14 +35,35 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, 
     
     A single 2D view is mathematically ill-posed for 3D reconstruction and causes
     3DGS to collapse into a flat 2D billboard. We gather multi-view cameras from
-    the earliest time frames (t <= max_t, minimum min_views) where motion is
-    negligible to reconstruct the true 360-degree base geometry without floaters.
+    the earliest time frames (t <= max_t, minimum min_views) and ensure all 4
+    azimuth quadrants include low-elevation side views (z < 2.2, t <= 0.125) so
+    vertical z-coordinates are tightly triangulated from 360 degrees.
     """
     ds = DNeRFDataset(cfg, split="train", categories=[category])
     sorted_idxs = sorted(range(len(ds)), key=lambda i: ds[i].time)
     selected = [i for i in sorted_idxs if ds[i].time <= max_t]
     if len(selected) < min_views:
         selected = sorted_idxs[:min(len(sorted_idxs), min_views)]
+
+    # Ensure 360-degree low-elevation side-view coverage across all 4 azimuth
+    # quadrants so overhead-only bias never leaves a vertical z-offset.
+    quads = {0: 0, 1: 0, 2: 0, 3: 0}
+    for i in selected:
+        pos = ds[i].c2w[:3, 3]
+        if float(pos[2].item()) < 2.2:
+            q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
+            quads[q] += 1
+
+    side_max_t = max(max_t, 0.125)
+    for i in sorted_idxs:
+        if ds[i].time > side_max_t or i in selected:
+            continue
+        pos = ds[i].c2w[:3, 3]
+        if float(pos[2].item()) < 2.2:
+            q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
+            if quads[q] < 2:
+                quads[q] += 1
+                selected.append(i)
 
     views = []
     for i in selected:

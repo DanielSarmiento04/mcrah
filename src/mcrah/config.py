@@ -70,7 +70,7 @@ class HypergraphConfig:
 @dataclass
 class MCRAHLossConfig:
     """Loss weights for the MCRAH novel-module regularizers."""
-    rigidity_weight: float = 0.05    # quasi-rigid-body prior
+    rigidity_weight: float = 0.10    # quasi-rigid-body prior
     topology_smoothness_weight: float = 1e-3  # temporal membership stability
 
 
@@ -90,8 +90,8 @@ class ModelConfig:
     predict_rotation: bool = True     # Delta rotation (as quaternion delta)
     predict_scale: bool = False
     predict_sh: bool = False
-    pos_scale: float = 0.25           # Max displacement scale in OffsetHeads (calibrated from 0.5)
-    motion_damping: float = 0.95     # Residual motion damping factor
+    pos_scale: float = 0.14           # Max displacement scale in OffsetHeads
+    motion_damping: float = 0.65     # Residual motion damping factor
     # Noise injection (rules.md Rule 4 / agent.md directive 4)
     noise_std: float = 1e-2
     noise_warmup_steps: int = 2_000
@@ -124,7 +124,7 @@ class TrainConfig:
     # Loss weights
     w_l1: float = 0.8
     w_ssim: float = 0.2
-    w_rel_l2: float = 0.005
+    w_rel_l2: float = 0.02
     w_lpips: float = 0.05  # perceptual loss weight (activated in joint stage)
     # Eval
     eval_every: int = 2_000
