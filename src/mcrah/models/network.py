@@ -136,18 +136,26 @@ class MCRAH(nn.Module):
             self.mcrah = self.mcrah.to(dev)
             membership = self.mcrah.update_membership(cloud.means)
             # Propagate through the adaptive (soft) hypergraph.
-            h = self.simgnn.encoder(cloud, self.cluster_id, time)
+            h = self.simgnn.encoder(cloud, self.cluster_id, time,
+                                    ref_means=self._cloud_means)
             for blk in self.simgnn.blocks:
                 h = blk._propagate_mcrah(h, self.mcrah.hypergraph)
             h = self.simgnn.final_norm(h)
         else:
             membership = None
             hg = self.hypergraph.to(dev)
-            h = self.simgnn.encode(cloud, hg, self.cluster_id, time)
+            h = self.simgnn.encode(cloud, hg, self.cluster_id, time,
+                                   ref_means=self._cloud_means)
 
         if self.dilated is not None:
             h = self.dhgc(h, self.dilated.to(dev))
         delta_pos, delta_rot = self.simgnn.heads(h)
+        # Smooth autoregressive temporal inertia: blend with previous step's
+        # displacement when stepping from an already-deformed state to prevent
+        # high-frequency period-2 oscillation during long rollouts.
+        prev_disp = cloud.means - self._cloud_means
+        if prev_disp.detach().abs().max() > 1e-7:
+            delta_pos = 0.65 * delta_pos + 0.35 * prev_disp
         new_cloud = apply_offsets(self.cloud, delta_pos, delta_rot)
         return RolloutStep(cloud=new_cloud, delta_pos=delta_pos,
                           delta_rot=delta_rot, membership=membership)
@@ -197,10 +205,13 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical appearance (SH & opacities) to fine-tune
-        if hasattr(self, "_cloud_sh") and hasattr(self, "_cloud_opacities"):
-            self._cloud_sh.requires_grad = (stage == "joint")
-            self._cloud_opacities.requires_grad = (stage == "joint")
+        # In joint stage, allow canonical 3D geometry & appearance to fine-tune
+        # across all 200 multi-view training cameras (overcoming the 13-view static init).
+        is_joint = (stage == "joint")
+        for attr in ("_cloud_means", "_cloud_scales", "_cloud_rotations",
+                     "_cloud_sh", "_cloud_opacities"):
+            if hasattr(self, attr):
+                getattr(self, attr).requires_grad = is_joint
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

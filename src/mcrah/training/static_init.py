@@ -193,37 +193,45 @@ def seed_cloud_from_views(
     """
     n_views = len(views)
     # 1. Coarse pass across the full D-NeRF world volume [-1.25, 1.25]^3
-    n_coarse = max(n_gaussians * 10, 250_000)
+    n_coarse = max(n_gaussians * 12, 300_000)
     coarse_pts = (torch.rand(n_coarse, 3, device=device) - 0.5) * 2.5
 
     accum_c, fg_c, bg_c = _project_and_score_candidates(coarse_pts, views)
 
-    # Strict visual hull: a 3D point inside the object projects to foreground in
-    # nearly all cameras and rarely hits white background.
+    # Multi-view silhouette carving: include both thick stationary regions (high
+    # fg_c) and thin/articulated extremities like the tail tip and jaw (which hit
+    # foreground in >= 45% of early cameras) so the coarse hull covers 100% of the anatomy.
+    min_target_core = min(max(n_gaussians // 2, 5000), n_coarse // 4)
     hull_mask = torch.zeros(n_coarse, dtype=torch.bool, device=device)
-    for max_misses in range(0, n_views + 1):
+    start_misses = max(1, int(n_views * 0.35))
+    for max_misses in range(start_misses, n_views + 1):
         min_hits = max(1, n_views - max_misses)
         cand_mask = (fg_c >= min_hits) & (bg_c <= max_misses)
-        if cand_mask.sum() >= min(n_gaussians // 4, 1500):
+        if cand_mask.sum() >= min_target_core:
             hull_mask = cand_mask
             break
+    if not hull_mask.any():
+        hull_mask = fg_c >= max(1, n_views // 3)
     if not hull_mask.any():
         hull_mask = fg_c > 0
 
     if hull_mask.sum() > 32:
         core_pts = coarse_pts[hull_mask]
-        # 2. Fine densification pass around the carved coarse visual hull
+        # 2. Fine densification pass around the full-anatomy coarse visual hull
         n_fine = max(n_gaussians * 6, 120_000)
         rep = (n_fine // core_pts.shape[0]) + 1
         fine_base = core_pts.repeat(rep, 1)[:n_fine]
-        fine_pts = (fine_base + torch.randn_like(fine_base) * 0.03).clamp(-1.35, 1.35)
+        fine_pts = (fine_base + torch.randn_like(fine_base) * 0.025).clamp(-1.35, 1.35)
 
         all_pts = torch.cat([core_pts, fine_pts], dim=0)
         accum_color, fg_hits, bg_misses = _project_and_score_candidates(all_pts, views)
 
-        # Score points by foreground consistency (fg_hits - 2 * bg_misses)
-        score = fg_hits - 2.0 * bg_misses
-        valid_hull = fg_hits > 0
+        # Balanced silhouette score that preserves thin high-detail bone extremities
+        score = fg_hits - 0.5 * bg_misses
+        min_valid_hits = max(1, int(n_views * 0.35)) if n_views >= 4 else 1
+        valid_hull = fg_hits >= min_valid_hits
+        if valid_hull.sum() < n_gaussians // 2:
+            valid_hull = fg_hits > 0
         hull_idx = torch.where(valid_hull)[0]
         sorted_idx = hull_idx[torch.argsort(score[hull_idx], descending=True)]
 
@@ -233,9 +241,9 @@ def seed_cloud_from_views(
             repeat_cnt = (n_gaussians // len(sorted_idx)) + 1
             sel_idx = sorted_idx.repeat(repeat_cnt)[:n_gaussians]
 
-        selected_pts = all_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.003
+        selected_pts = all_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.002
         selected_colors = accum_color[sel_idx] / fg_hits[sel_idx].unsqueeze(-1).clamp_min(1.0)
-        selected_opacities = torch.full((n_gaussians, 1), 0.2, device=device)
+        selected_opacities = torch.full((n_gaussians, 1), 0.5, device=device)
         return selected_pts, selected_colors, selected_opacities
     else:
         pts = torch.randn(n_gaussians, 3, device=device) * 0.35
@@ -361,8 +369,9 @@ class StaticGSInit:
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 photo_loss = self.loss_fn(pred, tgt)
-                # Mild opacity sparsity regularization to clear background floaters
-                op_reg = 2e-4 * torch.sigmoid(cloud.opacities).mean()
+                # Gentle opacity sparsity regularization to clear empty-space floaters
+                # without erasing thin white bone structures (ribs/tail tip).
+                op_reg = 4e-5 * torch.sigmoid(cloud.opacities).mean()
                 loss = photo_loss + op_reg
                 (loss / n_views).backward()
                 total = total + float(photo_loss.item())
@@ -381,9 +390,9 @@ class StaticGSInit:
                 print(f"  static-3dgs iter {it+1}/{iters}  "
                       f"loss={total:.5f}")
 
-        # Prune transparent floaters (logit <= -2.2 -> opacity <= 0.10)
+        # Prune transparent floaters (logit <= -3.2 -> opacity <= 0.039)
         with torch.no_grad():
-            valid_mask = (cloud.opacities.squeeze(-1) > -2.2)
+            valid_mask = (cloud.opacities.squeeze(-1) > -3.2)
             if valid_mask.sum() > 500:  # Retain active visual hull cloud
                 cloud = GaussianCloud(
                     means=cloud.means[valid_mask],

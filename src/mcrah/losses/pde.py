@@ -103,5 +103,8 @@ class PDERegularizer(nn.Module):
             return offsets.new_zeros((), dtype=torch.float32)
         offsets_f = offsets.float()
         d2 = offsets_f[2:] - 2.0 * offsets_f[1:-1] + offsets_f[:-2]  # (T-2,N,D)
-        res = self.lam * (d2 ** 2).mean()
+        # Normalize by mean displacement energy so temporal curvature penalty is
+        # dimensionless and properly scaled (~1e-3) rather than ~1e-8.
+        scale = (offsets_f ** 2).mean().detach().clamp_min(1e-4)
+        res = self.lam * ((d2 ** 2).mean() / scale)
         return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)

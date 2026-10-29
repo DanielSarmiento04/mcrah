@@ -116,7 +116,14 @@ class DHGC(nn.Module):
         })
         self.fuse = nn.Linear(d * len(self.levels), d) if len(self.levels) > 1 \
             else nn.Identity()
+        if isinstance(self.fuse, nn.Linear):
+            nn.init.normal_(self.fuse.weight, std=1e-2)
+            nn.init.zeros_(self.fuse.bias)
         self.norm = nn.LayerNorm(d)
+        # Gated residual connection so Stage 1 (dense) features pass through
+        # cleanly while DHGC is frozen, and Stage 2 (farfield) learns a smooth
+        # multi-scale refinement on top of SIMGNN features.
+        self.res_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: torch.Tensor, dilated) -> torch.Tensor:
         """Args:
@@ -128,9 +135,9 @@ class DHGC(nn.Module):
         for k in self.levels:
             idx = dilated.padded[k].to(x.device)
             mask = dilated.mask[k].to(x.device)
-            outs.append(self.blocks[str(k)](x, idx, mask))
+            outs.append(self.blocks[str(k)](x, idx, mask) - x)
         if len(self.levels) > 1:
-            out = self.fuse(torch.cat(outs, dim=-1))
+            delta = self.fuse(torch.cat(outs, dim=-1))
         else:
-            out = outs[0]
-        return self.norm(out)
+            delta = outs[0]
+        return self.norm(x + self.res_scale * delta)

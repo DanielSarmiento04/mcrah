@@ -80,16 +80,27 @@ class FeatureEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(feat_dim, feat_dim),
         )
+        # Smooth displacement encoder for autoregressive state (means_t - means_0).
+        # Avoids feeding deformed positions into high-frequency sin(32*pi*x) bands
+        # which caused period-2 Nyquist phase flips during rollout.
+        self.disp_mlp = nn.Sequential(
+            nn.Linear(3, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+        nn.init.zeros_(self.disp_mlp[-1].weight)
+        nn.init.zeros_(self.disp_mlp[-1].bias)
 
-    def forward(self, cloud, cluster_id: torch.Tensor, time: torch.Tensor
-                ) -> torch.Tensor:
+    def forward(self, cloud, cluster_id: torch.Tensor, time: torch.Tensor,
+                ref_means: Optional[torch.Tensor] = None) -> torch.Tensor:
         # time: (N,1) or scalar -> (N,1)
         if time.dim() == 0:
             time = time.expand(cloud.means.shape[0], 1)
         elif time.dim() == 1:
             time = time.view(-1, 1)
 
-        pos_feat = self.pos_encoder(cloud.means)
+        base_pos = ref_means if ref_means is not None else cloud.means
+        pos_feat = self.pos_encoder(base_pos)
         time_feat = self.time_encoder(time.to(cloud.means.dtype))
 
         op = cloud.opacities[:, :1]
@@ -98,6 +109,9 @@ class FeatureEncoder(nn.Module):
         cid = cluster_id.clamp(0, self.cluster_emb.num_embeddings - 1)
         h = h + self.cluster_emb(cid)
         h = h + self.time_mlp(time_feat)
+        if ref_means is not None:
+            disp = cloud.means - ref_means
+            h = h + self.disp_mlp(disp)
         return h
 
 
@@ -242,14 +256,15 @@ class SIMGNN(nn.Module):
         )
 
     def encode(self, cloud, hypergraph, cluster_id: torch.Tensor,
-               time: torch.Tensor) -> torch.Tensor:
+               time: torch.Tensor,
+               ref_means: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run the feature encoder + hypergraph propagation blocks.
 
         Stops *before* the offset heads so Stage-2 (DHGC) can refine the node
         features (workflow.md Phase 3 Step 7): ``h = SIMGNN(cloud, hg)`` then
         ``h = DHGC(h, dilated)`` then ``Δpos, Δrot = heads(h)``.
         """
-        h = self.encoder(cloud, cluster_id, time)
+        h = self.encoder(cloud, cluster_id, time, ref_means=ref_means)
         for blk in self.blocks:
             h = blk(h, hypergraph)
         return self.final_norm(h)

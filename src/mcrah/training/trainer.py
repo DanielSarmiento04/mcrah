@@ -142,13 +142,22 @@ class MCRAHTrainer:
             lr = cfg.train.lr
 
         net_params = []
-        cloud_params = []
-        cloud_names = {"_cloud_sh", "_cloud_opacities", "_cloud_scales", "_cloud_means"}
+        cloud_pos_params = []
+        cloud_scale_params = []
+        cloud_app_params = []
+        cloud_names = {
+            "_cloud_means", "_cloud_rotations",
+            "_cloud_scales", "_cloud_sh", "_cloud_opacities",
+        }
         for name, p in self.model.named_parameters():
             if p.requires_grad:
-                if any(cn in name for cn in cloud_names):
-                    cloud_params.append(p)
-                else:
+                if "_cloud_means" in name or "_cloud_rotations" in name:
+                    cloud_pos_params.append(p)
+                elif "_cloud_scales" in name:
+                    cloud_scale_params.append(p)
+                elif "_cloud_sh" in name or "_cloud_opacities" in name:
+                    cloud_app_params.append(p)
+                elif not any(cn in name for cn in cloud_names):
                     net_params.append(p)
 
         param_groups = []
@@ -156,11 +165,17 @@ class MCRAHTrainer:
             param_groups.append({
                 "params": net_params, "lr": lr, "weight_decay": cfg.train.weight_decay
             })
-        if cloud_params:
-            # Fine-tune canonical appearance gently without weight decay
-            cloud_lr = min(lr, 5e-4)
+        if cloud_pos_params:
             param_groups.append({
-                "params": cloud_params, "lr": cloud_lr, "weight_decay": 0.0
+                "params": cloud_pos_params, "lr": min(lr, 1.6e-4), "weight_decay": 0.0
+            })
+        if cloud_scale_params:
+            param_groups.append({
+                "params": cloud_scale_params, "lr": min(lr * 2.5, 1e-3), "weight_decay": 0.0
+            })
+        if cloud_app_params:
+            param_groups.append({
+                "params": cloud_app_params, "lr": min(lr * 2.5, 5e-4), "weight_decay": 0.0
             })
 
         if not param_groups:
@@ -391,6 +406,17 @@ class MCRAHTrainer:
                 step_successful = False
 
         self.noise.step()
+        if step_successful and self.state.stage == "joint":
+            with torch.no_grad():
+                self.model._cloud_scales.data.clamp_(-7.0, -3.2)
+                self.model._cloud_sh.data.clamp_(0.0, 1.0)
+                self.model._cloud_opacities.data.clamp_(-8.0, 5.0)
+                q = self.model._cloud_rotations.data
+                self.model._cloud_rotations.data.copy_(
+                    q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                )
+                if self.model.mcrah is not None:
+                    self.model.mcrah.means_0.copy_(self.model._cloud_means.detach())
         if self._scheduler is not None and step_successful:
             self._scheduler.step()
         metrics["lr"] = float(self._opt.param_groups[0]["lr"])
