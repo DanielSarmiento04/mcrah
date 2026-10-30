@@ -56,10 +56,14 @@ class L1SSIMLoss(nn.Module):
         pred_f = pred.float()
         target_f = target.float()
         l1 = F.l1_loss(pred_f, target_f)
+        # Include direct MSE (L2) penalty alongside L1 so high-contrast bone/rib
+        # edges (|err| > 0.20, which dominate PSNR = -10*log10(MSE)) receive
+        # error-proportional gradients rather than uniform sign gradients.
+        l2 = F.mse_loss(pred_f, target_f)
         win = self._channel_window(pred_f.shape[1], pred_f.device, torch.float32)
         ssim_map = _ssim_map(pred_f, target_f, win, self.c1, self.c2)
         ssim_loss = 1.0 - ssim_map.mean()
-        return self.w_l1 * l1 + self.w_ssim * ssim_loss
+        return self.w_l1 * (0.6 * l1 + 2.5 * l2) + self.w_ssim * ssim_loss
 
     @torch.no_grad()
     def ssim_value(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

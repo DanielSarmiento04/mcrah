@@ -99,8 +99,8 @@ class ModelConfig:
     pde_weight: float = 1e-2
     # Relative L2 regularization weight (rules.md Rule 4)
     rel_l2_weight: float = 1e-3
-    # Activation
-    dropout: float = 0.1
+    # Activation (0.0 dropout for sub-pixel coordinate regression precision)
+    dropout: float = 0.0
 
 
 @dataclass

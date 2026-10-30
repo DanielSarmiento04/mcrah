@@ -428,27 +428,36 @@ class StaticGSInit:
         history: List[float] = []
         bg = torch.ones(3, device=dev) if cfg.data.white_background else None
         n_views = max(1, len(views))
-        recycle_steps = {int(iters * 0.30), int(iters * 0.60)} if iters >= 200 else set()
+        # First 13 views are strictly t <= max_t; any extra views are auxiliary
+        # 360-degree side views used in the first 45% of iterations to lock 3D
+        # z-height before fine rib/bone sharpening on strictly t <= max_t views.
+        n_core_views = min(13, n_views) if n_views > 13 else n_views
+        recycle_steps = (
+            {int(iters * 0.25), int(iters * 0.45), int(iters * 0.65)}
+            if iters >= 200 else set()
+        )
 
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
-            for img, c2w, K in views:
+            active_views = views if it < int(iters * 0.45) else views[:n_core_views]
+            n_act = max(1, len(active_views))
+            for img, c2w, K in active_views:
                 out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 photo_loss = self.loss_fn(pred, tgt)
-                # Gentle opacity sparsity regularization during the first 70% of
+                # Gentle opacity sparsity regularization during the first 65% of
                 # static init to clear floaters, then 0 so solid surfaces (stone
                 # pedestal and white bone) reach full opacity without background bleed.
-                if it < int(iters * 0.70):
-                    op_reg = 2.5e-5 * torch.sigmoid(cloud.opacities).mean()
+                if it < int(iters * 0.65):
+                    op_reg = 2.0e-5 * torch.sigmoid(cloud.opacities).mean()
                 else:
                     op_reg = 0.0
                 loss = photo_loss + op_reg
-                (loss / n_views).backward()
+                (loss / n_act).backward()
                 total = total + float(photo_loss.item())
-            total = total / n_views
+            total = total / n_act
             opt.step()
             sched.step()
 
@@ -459,7 +468,9 @@ class StaticGSInit:
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-8.0, 5.0)
                 if (it + 1) in recycle_steps and cloud.n >= 500:
-                    self._recycle_transparent_to_high_error(cloud, views, W, H, bg)
+                    self._recycle_transparent_to_high_error(
+                        cloud, views[:n_core_views], W, H, bg, opt=opt
+                    )
 
             history.append(float(total))
             if (it + 1) % max(1, iters // 10) == 0:
@@ -496,33 +507,42 @@ class StaticGSInit:
         W: int,
         H: int,
         bg: Optional[torch.Tensor],
+        opt: Optional[torch.optim.Optimizer] = None,
     ) -> None:
-        """Teleport transparent Gaussians (logit < -1.8) directly onto the
-        highest-photometric-error foreground pixels via multi-view ray-carving."""
-        dead_idx = torch.where(cloud.opacities.squeeze(-1) < -1.8)[0]
-        if dead_idx.numel() < 16:
+        """Teleport low-opacity Gaussians directly onto the highest-MSE
+        foreground pixels (ribs, skull, tail vertebrae) via multi-view ray-carving,
+        and reset their Adam momentum states so stale velocity does not fling them away."""
+        op_flat = cloud.opacities.squeeze(-1)
+        cand_mask = op_flat < -0.2
+        if cand_mask.sum() < 16:
             return
-        n_recycle = min(int(dead_idx.numel()), max(64, cloud.n // 4))
-        dead_idx = dead_idx[:n_recycle]
+        max_recycle = max(64, cloud.n // 12)
+        cand_idx = torch.where(cand_mask)[0]
+        if cand_idx.numel() > max_recycle:
+            _, lowest_order = torch.topk(op_flat[cand_idx], max_recycle, largest=False)
+            dead_idx = cand_idx[lowest_order]
+        else:
+            dead_idx = cand_idx
+        n_recycle = int(dead_idx.numel())
         per_view = max(8, (n_recycle // max(1, len(views))) + 4)
 
         new_pts_list: List[torch.Tensor] = []
         new_col_list: List[torch.Tensor] = []
         for img, c2w, K in views:
             out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
-            err = (out.image - img).abs().mean(dim=0)  # (H, W)
+            sq_err = ((out.image - img) ** 2).mean(dim=0)  # (H, W)
             fg_mask = (img < 0.985).any(dim=0)
-            ys, xs = torch.where(fg_mask & (err > 0.02))
+            ys, xs = torch.where(fg_mask & (sq_err > 0.002))
             if ys.numel() < 8:
                 continue
-            weights = (err[ys, xs] ** 2).clamp_min(1e-6)
+            weights = (sq_err[ys, xs] ** 1.5).clamp_min(1e-8)
             k = min(per_view, ys.numel())
             sel = torch.multinomial(weights, k, replacement=False)
             u_s, v_s = xs[sel], ys[sel]
-            b_pts, b_cols, _ = _carve_rays_from_pixels(u_s, v_s, c2w, K, views, n_depths=48)
+            b_pts, b_cols, _ = _carve_rays_from_pixels(u_s, v_s, c2w, K, views, n_depths=64)
             view_cols = img[:, v_s, u_s].t()
             new_pts_list.append(b_pts)
-            new_col_list.append(0.7 * view_cols + 0.3 * b_cols)
+            new_col_list.append(0.75 * view_cols + 0.25 * b_cols)
 
         if not new_pts_list:
             return
@@ -530,10 +550,20 @@ class StaticGSInit:
         new_cols = torch.cat(new_col_list, dim=0)
         count = min(dead_idx.numel(), new_pts.shape[0])
         target_idx = dead_idx[:count]
-        cloud.means.data[target_idx] = new_pts[:count] + torch.randn_like(new_pts[:count]) * 0.001
+        cloud.means.data[target_idx] = new_pts[:count] + torch.randn_like(new_pts[:count]) * 0.0008
         cloud.sh.data[target_idx] = new_cols[:count].clamp(0.0, 1.0)
-        cloud.opacities.data[target_idx] = 0.6
-        cloud.scales.data[target_idx] = -5.15
+        cloud.opacities.data[target_idx] = 0.85
+        cloud.scales.data[target_idx] = -5.25
+
+        # Reset Adam momentum (exp_avg, exp_avg_sq) for recycled Gaussians (3DGS convention)
+        if opt is not None:
+            for p in (cloud.means, cloud.scales, cloud.opacities, cloud.sh, cloud.rotations):
+                st = opt.state.get(p)
+                if st is not None:
+                    if "exp_avg" in st and st["exp_avg"].shape[0] == cloud.n:
+                        st["exp_avg"][target_idx] = 0.0
+                    if "exp_avg_sq" in st and st["exp_avg_sq"].shape[0] == cloud.n:
+                        st["exp_avg_sq"][target_idx] = 0.0
 
 
 def save_cloud(cloud: GaussianCloud, path: Path | str) -> None:

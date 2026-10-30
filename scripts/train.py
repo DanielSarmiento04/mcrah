@@ -54,14 +54,14 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, 
             q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
             quads[q] += 1
 
-    side_max_t = max(max_t, 0.125)
+    side_max_t = max(max_t, 0.10)
     for i in sorted_idxs:
         if ds[i].time > side_max_t or i in selected:
             continue
         pos = ds[i].c2w[:3, 3]
         if float(pos[2].item()) < 2.2:
             q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
-            if quads[q] < 2:
+            if quads[q] < 1:
                 quads[q] += 1
                 selected.append(i)
 

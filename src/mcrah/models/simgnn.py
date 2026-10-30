@@ -273,10 +273,11 @@ class SIMGNN(nn.Module):
         features (workflow.md Phase 3 Step 7): ``h = SIMGNN(cloud, hg)`` then
         ``h = DHGC(h, dilated)`` then ``Δpos, Δrot = heads(h)``.
         """
-        h = self.encoder(cloud, cluster_id, time, ref_means=ref_means)
+        h0 = self.encoder(cloud, cluster_id, time, ref_means=ref_means)
+        h = h0
         for blk in self.blocks:
             h = blk(h, hypergraph)
-        return self.final_norm(h)
+        return self.final_norm(h + h0)
 
     def forward(self, cloud, hypergraph, cluster_id: torch.Tensor,
                time: torch.Tensor):

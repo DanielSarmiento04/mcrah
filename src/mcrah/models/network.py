@@ -135,12 +135,13 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             self.mcrah = self.mcrah.to(dev)
             membership = self.mcrah.update_membership(cloud.means)
-            # Propagate through the adaptive (soft) hypergraph.
-            h = self.simgnn.encoder(cloud, self.cluster_id, time,
-                                    ref_means=self._cloud_means)
+            # Propagate through the adaptive (soft) hypergraph with local-global skip.
+            h0 = self.simgnn.encoder(cloud, self.cluster_id, time,
+                                     ref_means=self._cloud_means)
+            h = h0
             for blk in self.simgnn.blocks:
                 h = blk._propagate_mcrah(h, self.mcrah.hypergraph)
-            h = self.simgnn.final_norm(h)
+            h = self.simgnn.final_norm(h + h0)
         else:
             membership = None
             hg = self.hypergraph.to(dev)
@@ -205,14 +206,16 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical geometry & appearance to fine-tune across
-        # all 200 multi-view training cameras (with precision-capped LR on means/rot
-        # in the trainer so moving bones do not smear while side views align tightly).
+        # In joint stage, allow canonical scales & appearance (SH, opacities, scales)
+        # to fine-tune across all 200 multi-view training cameras while keeping
+        # canonical 3D positions (_cloud_means) anchored to the sharp t=0 geometry.
         is_joint = (stage == "joint")
-        for attr in ("_cloud_means", "_cloud_rotations",
-                     "_cloud_scales", "_cloud_sh", "_cloud_opacities"):
+        for attr in ("_cloud_scales", "_cloud_sh", "_cloud_opacities"):
             if hasattr(self, attr):
                 getattr(self, attr).requires_grad = is_joint
+        for attr in ("_cloud_means", "_cloud_rotations"):
+            if hasattr(self, attr):
+                getattr(self, attr).requires_grad = False
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
