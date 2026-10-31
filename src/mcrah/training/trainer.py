@@ -166,10 +166,10 @@ class MCRAHTrainer:
                 "params": net_params, "lr": lr, "weight_decay": cfg.train.weight_decay
             })
         if cloud_pos_params:
-            # Gentle precision-capped LR (<= 4e-5) so multi-view side cameras align
+            # Gentle precision-capped LR (<= 2.5e-5) so multi-view side cameras align
             # 3D geometry without smearing dynamic bones into a temporal average.
             param_groups.append({
-                "params": cloud_pos_params, "lr": min(lr * 0.2, 4e-5), "weight_decay": 0.0
+                "params": cloud_pos_params, "lr": min(lr * 0.12, 2.5e-5), "weight_decay": 0.0
             })
         if cloud_scale_params:
             param_groups.append({

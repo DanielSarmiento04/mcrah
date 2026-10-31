@@ -54,7 +54,7 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, 
             q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
             quads[q] += 1
 
-    side_max_t = max(max_t, 0.10)
+    side_max_t = max(max_t, 0.125)
     for i in sorted_idxs:
         if ds[i].time > side_max_t or i in selected:
             continue

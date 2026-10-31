@@ -290,7 +290,12 @@ def build_hypergraph_from_features(feats: torch.Tensor, k: Optional[int] = None,
     k = min(k, n)
     device = feats.device
 
-    x = torch.nn.functional.normalize(feats, dim=-1)
+    # Stereographic / homogeneous lifting before L2 normalization so radial
+    # distance from the origin (0,0,0) is preserved rather than collapsing
+    # concentric 3D shells (e.g. pedestal vs ribcage) along rays from the origin.
+    r_scale = feats.norm(dim=-1).mean().clamp_min(0.25)
+    feats_h = torch.cat([feats, torch.full((n, 1), float(r_scale.item()), device=device, dtype=feats.dtype)], dim=-1)
+    x = torch.nn.functional.normalize(feats_h, dim=-1)
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
     # k-means++ init

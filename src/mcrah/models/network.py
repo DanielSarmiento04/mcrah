@@ -68,10 +68,15 @@ class MCRAH(nn.Module):
         # a learnable parameter (the static 3DGS fit is a separate Phase 1 step).
         self.register_cloud(cloud)
 
-        # Build or accept the graph structures.
+        # Build or accept the graph structures. Include color SH alongside 3D
+        # coordinates so static pedestal Gaussians and dynamic bone Gaussians
+        # are cleanly separated into distinct hyperedges.
         if hypergraph is None:
+            hg_feats = torch.cat(
+                [cloud.means.detach(), (cloud.sh.detach() - 0.5) * 0.8], dim=-1
+            )
             hypergraph = build_hypergraph_from_features(
-                cloud.means.detach(), seed=cfg.hypergraph.seed
+                hg_feats, seed=cfg.hypergraph.seed
             )
         self.hypergraph = hypergraph
         if dilated is None:
@@ -206,16 +211,12 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical scales & appearance (SH, opacities, scales)
-        # to fine-tune across all 200 multi-view training cameras while keeping
-        # canonical 3D positions (_cloud_means) anchored to the sharp t=0 geometry.
+        # In joint stage, allow canonical 3D geometry & appearance to fine-tune
+        # across all 200 multi-view training cameras with a precision-capped LR.
         is_joint = (stage == "joint")
-        for attr in ("_cloud_scales", "_cloud_sh", "_cloud_opacities"):
+        for attr in ("_cloud_means", "_cloud_rotations", "_cloud_scales", "_cloud_sh", "_cloud_opacities"):
             if hasattr(self, attr):
                 getattr(self, attr).requires_grad = is_joint
-        for attr in ("_cloud_means", "_cloud_rotations"):
-            if hasattr(self, attr):
-                getattr(self, attr).requires_grad = False
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

@@ -440,9 +440,11 @@ class StaticGSInit:
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
-            active_views = views if it < int(iters * 0.45) else views[:n_core_views]
-            n_act = max(1, len(active_views))
-            for img, c2w, K in active_views:
+            aux_w = 1.0 if it < int(iters * 0.45) else 0.30
+            w_sum = float(n_core_views) + aux_w * float(max(0, n_views - n_core_views))
+            w_sum = max(1.0, w_sum)
+            for v_idx, (img, c2w, K) in enumerate(views):
+                vw = 1.0 if v_idx < n_core_views else aux_w
                 out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
@@ -454,10 +456,9 @@ class StaticGSInit:
                     op_reg = 2.0e-5 * torch.sigmoid(cloud.opacities).mean()
                 else:
                     op_reg = 0.0
-                loss = photo_loss + op_reg
-                (loss / n_act).backward()
-                total = total + float(photo_loss.item())
-            total = total / n_act
+                loss = (photo_loss + op_reg) * (vw / w_sum)
+                loss.backward()
+                total = total + float(photo_loss.item()) * (vw / w_sum)
             opt.step()
             sched.step()
 
