@@ -30,27 +30,44 @@ from mcrah.training import (
 )
 
 
+# Official D-NeRF CVPR benchmark baseline metrics per category (Pumarola et al., CVPR)
+CVPR_BASELINES = {
+    "bouncingballs": {"psnr": 38.93, "ssim": 0.9870, "lpips": 0.0310},
+    "hellwarrior":   {"psnr": 25.02, "ssim": 0.9550, "lpips": 0.0630},
+    "hook":          {"psnr": 29.25, "ssim": 0.9680, "lpips": 0.1120},
+    "jumpingjacks":  {"psnr": 32.80, "ssim": 0.9810, "lpips": 0.0380},
+    "lego":          {"psnr": 21.64, "ssim": 0.8390, "lpips": 0.1630},
+    "mutant":        {"psnr": 31.29, "ssim": 0.9780, "lpips": 0.0210},
+    "standup":       {"psnr": 32.79, "ssim": 0.9830, "lpips": 0.0240},
+    "trex":          {"psnr": 31.75, "ssim": 0.9740, "lpips": 0.0410},
+}
+
+
 def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, min_views: int = 12):
     """Load early / near t=0 training views for static 3DGS initialization.
     
     A single 2D view is mathematically ill-posed for 3D reconstruction and causes
     3DGS to collapse into a flat 2D billboard. We gather multi-view cameras from
-    the earliest time frames (t <= max_t, minimum min_views) and ensure all 4
-    azimuth quadrants include low-elevation side views (z < 2.2, t <= 0.125) so
+    the earliest time frames (t <= max_t, scaled to dataset length so smaller
+    scenes like lego/hook/hellwarrior stay near t=0) and ensure all 4 azimuth
+    quadrants include low-elevation side views (|z| < 2.2, t <= 0.125) so
     vertical z-coordinates are tightly triangulated from 360 degrees.
     """
     ds = DNeRFDataset(cfg, split="train", categories=[category])
     sorted_idxs = sorted(range(len(ds)), key=lambda i: ds[i].time)
+    target_min = max(6, min(min_views, round(len(ds) * 0.065)))
     selected = [i for i in sorted_idxs if ds[i].time <= max_t]
-    if len(selected) < min_views:
-        selected = sorted_idxs[:min(len(sorted_idxs), min_views)]
+    if len(selected) < target_min:
+        selected = sorted_idxs[:min(len(sorted_idxs), target_min)]
+    elif len(selected) > min_views + 2:
+        selected = selected[:min_views + 2]
 
     # Ensure 360-degree low-elevation side-view coverage across all 4 azimuth
     # quadrants so overhead-only bias never leaves a vertical z-offset.
     quads = {0: 0, 1: 0, 2: 0, 3: 0}
     for i in selected:
         pos = ds[i].c2w[:3, 3]
-        if float(pos[2].item()) < 2.2:
+        if abs(float(pos[2].item())) < 2.2:
             q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
             quads[q] += 1
 
@@ -59,7 +76,7 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, 
         if ds[i].time > side_max_t or i in selected:
             continue
         pos = ds[i].c2w[:3, 3]
-        if float(pos[2].item()) < 2.2:
+        if abs(float(pos[2].item())) < 2.2:
             q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
             if quads[q] < 1:
                 quads[q] += 1
@@ -89,15 +106,20 @@ def run_category(cfg: Config, category: str, args) -> dict:
         print(f"[{category}] loading existing static cloud")
         cloud = load_cloud(cloud_path, device=device)
     else:
+        max_t0 = getattr(args, "max_t0", 0.06)
+        min_t0 = getattr(args, "min_t0_views", 12)
         views = load_t0_views(
             cfg, category, device,
-            max_t=getattr(args, "max_t0", 0.04),
-            min_views=getattr(args, "min_t0_views", 6),
+            max_t=max_t0,
+            min_views=min_t0,
         )
+        ds_tmp = DNeRFDataset(cfg, split="train", categories=[category])
+        n_core = max(6, min(min_t0, sum(1 for i in range(len(ds_tmp)) if ds_tmp[i].time <= max_t0)))
         static_init = StaticGSInit(cfg, device=device)
         result = static_init.fit(
             views,
             iterations=args.static_iters,
+            n_core_views=min(n_core, len(views)),
         )
         cloud = result.cloud
         save_cloud(cloud, cloud_path)
@@ -154,13 +176,16 @@ def run_category(cfg: Config, category: str, args) -> dict:
           f"{final_drift:.5f}")
 
     # Save results.
+    base_ref = CVPR_BASELINES.get(category)
     results = {
         "category": category,
+        "adaptive_hypergraph": bool(cfg.hypergraph.adaptive),
         "static_gaussians": cloud.n,
         "eval": {"psnr": metrics.psnr_mean if metrics else None,
                   "ssim": metrics.ssim_mean if metrics else None,
                   "lpips": metrics.lpips_mean if metrics else None}
             if metrics else None,
+        "cvpr_baseline": base_ref,
         "rollout_final_drift": final_drift,
         "rollout_steps": len(stability.steps),
         "rollout_step_indices": stability.steps,
@@ -169,6 +194,49 @@ def run_category(cfg: Config, category: str, args) -> dict:
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
     return results
+
+
+def print_cvpr_comparison_table(all_results: dict, out_root: Path) -> None:
+    """Print per-category and mean metrics alongside the CVPR paper baseline."""
+    print("\n" + "=" * 92)
+    print(f"{'CATEGORY':15s} | {'PSNR (Ours / CVPR)':20s} | {'SSIM (Ours / CVPR)':20s} | {'LPIPS (Ours / CVPR)':21s} | {'DRIFT@100':9s}")
+    print("-" * 92)
+    ours_psnr, ours_ssim, ours_lpips, ours_drift = [], [], [], []
+    base_psnr, base_ssim, base_lpips = [], [], []
+
+    for cat, r in all_results.items():
+        if "error" in r:
+            print(f"{cat:15s} | ERROR: {r['error']}")
+            continue
+        ev = r.get("eval") or {}
+        b = CVPR_BASELINES.get(cat, {})
+        p_o, s_o, l_o = ev.get("psnr") or 0.0, ev.get("ssim") or 0.0, ev.get("lpips") or 0.0
+        p_b, s_b, l_b = b.get("psnr") or 0.0, b.get("ssim") or 0.0, b.get("lpips") or 0.0
+        dr = r.get("rollout_final_drift") or 0.0
+        ours_psnr.append(p_o); ours_ssim.append(s_o); ours_lpips.append(l_o); ours_drift.append(dr)
+        if b:
+            base_psnr.append(p_b); base_ssim.append(s_b); base_lpips.append(l_b)
+        print(f"{cat:15s} | {p_o:6.2f} / {p_b:6.2f} dB   | {s_o:6.4f} / {s_b:6.4f}      | {l_o:6.4f} / {l_b:6.4f}       | {dr:9.5f}")
+
+    if ours_psnr:
+        print("-" * 92)
+        mp_o = sum(ours_psnr) / len(ours_psnr)
+        ms_o = sum(ours_ssim) / len(ours_ssim)
+        ml_o = sum(ours_lpips) / len(ours_lpips)
+        md_o = sum(ours_drift) / len(ours_drift)
+        mp_b = sum(base_psnr) / max(1, len(base_psnr))
+        ms_b = sum(base_ssim) / max(1, len(base_ssim))
+        ml_b = sum(base_lpips) / max(1, len(base_lpips))
+        print(f"{'MEAN':15s} | {mp_o:6.2f} / {mp_b:6.2f} dB   | {ms_o:6.4f} / {ms_b:6.4f}      | {ml_o:6.4f} / {ml_b:6.4f}       | {md_o:9.5f}")
+    print("=" * 92)
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    summary_payload = {
+        "categories": all_results,
+        "cvpr_baselines": CVPR_BASELINES,
+    }
+    with open(out_root / "summary_cvpr_comparison.json", "w") as f:
+        json.dump(summary_payload, f, indent=2)
 
 
 def main():
@@ -207,6 +275,8 @@ def main():
                    help="max time threshold for static t=0 view selection (default: 0.06)")
     p.add_argument("--min-t0-views", type=int, default=12,
                    help="minimum multi-view cameras for static initialization (default: 12)")
+    p.add_argument("--no-adaptive", action="store_true",
+                   help="disable adaptive hypergraph (run static DVHGNN CVPR baseline arm)")
     p.add_argument("--skip-static", action="store_true",
                    help="reuse existing static cloud if present")
     p.add_argument("--quick", action="store_true",
@@ -223,6 +293,8 @@ def main():
             args.num_gaussians = 2000
 
     cfg = Config()
+    if args.no_adaptive:
+        cfg.hypergraph.adaptive = False
     # Apply CLI memory overrides (the pure-torch rasterizer is O(N*H*W) in
     # autograd memory; defaults target a production-scale cloud that will swap
     # a laptop to death — see rules.md Rule 6).
@@ -250,16 +322,7 @@ def main():
             import traceback; traceback.print_exc()
             all_results[cat] = {"error": str(e)}
 
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    for cat, r in all_results.items():
-        if "error" in r:
-            print(f"  {cat:16s} ERROR: {r['error']}")
-        else:
-            ev = r.get("eval") or {}
-            print(f"  {cat:16s} PSNR={ev.get('psnr', 0):.2f}  "
-                  f"drift={r['rollout_final_drift']:.4f}")
+    print_cvpr_comparison_table(all_results, Path(args.out))
     return all_results
 
 

@@ -341,6 +341,7 @@ class StaticGSInit:
         views: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         init_points: Optional[torch.Tensor] = None,
         iterations: Optional[int] = None,
+        n_core_views: Optional[int] = None,
     ) -> StaticInitResult:
         """Fit a static cloud to ``views`` = list of (image, c2w, intrinsics).
 
@@ -431,7 +432,10 @@ class StaticGSInit:
         # First 13 views are strictly t <= max_t; any extra views are auxiliary
         # 360-degree side views used in the first 45% of iterations to lock 3D
         # z-height before fine rib/bone sharpening on strictly t <= max_t views.
-        n_core_views = min(13, n_views) if n_views > 13 else n_views
+        if n_core_views is None:
+            n_core_views = min(13, n_views) if n_views > 13 else n_views
+        else:
+            n_core_views = max(1, min(int(n_core_views), n_views))
         recycle_steps = (
             {int(iters * 0.25), int(iters * 0.45), int(iters * 0.65)}
             if iters >= 200 else set()
