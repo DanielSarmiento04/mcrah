@@ -142,12 +142,14 @@ def apply_offsets(
     delta_rot: torch.Tensor | None = None,
     delta_scale: torch.Tensor | None = None,
     delta_sh: torch.Tensor | None = None,
+    delta_opacity: torch.Tensor | None = None,
 ) -> GaussianCloud:
     """Apply predicted autoregressive offsets to a base Gaussian cloud
     (workflow.md Phase 3 Step 7). Rotations are composed as a delta quaternion."""
     means = cloud.means if delta_pos is None else cloud.means + delta_pos
     scales = cloud.scales if delta_scale is None else cloud.scales + delta_scale
     sh = cloud.sh if delta_sh is None else cloud.sh + delta_sh
+    opacities = cloud.opacities if delta_opacity is None else cloud.opacities + delta_opacity
     if delta_rot is not None:
         rot = quaternion_multiply(
             quaternion_normalize(cloud.rotations),
@@ -160,6 +162,6 @@ def apply_offsets(
         means=torch.nan_to_num(means, nan=0.0),
         scales=torch.nan_to_num(scales, nan=0.0),
         rotations=rot,
-        opacities=cloud.opacities,
+        opacities=torch.nan_to_num(opacities, nan=0.0),
         sh=torch.nan_to_num(sh, nan=0.0),
     )

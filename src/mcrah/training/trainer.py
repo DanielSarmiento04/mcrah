@@ -229,17 +229,24 @@ class MCRAHTrainer:
         if len(times) <= tw:
             window = times
         else:
-            # Mix fine contiguous rollouts (stride=1) with multi-view strided
-            # rollouts (stride in 2..8) so autoregressive steps span real camera
-            # baseline changes and match evaluation step intervals.
-            max_stride = max(1, min(8, (len(times) - 1) // max(1, tw - 1)))
-            if max_stride > 1 and float(torch.rand(1).item()) < 0.5:
-                stride = int(torch.randint(2, max_stride + 1, (1,)).item())
+            mode = float(torch.rand(1).item())
+            if mode < 0.45:
+                # Full-horizon sorted trajectory across [0, 1]: ensures early and
+                # late frames (t in [0.85, 1.0]) receive equal supervision and
+                # matches the multi-step evaluation trajectory across [0, 1].
+                perm = torch.randperm(len(times))[:tw].sort().values.tolist()
+                window = [times[idx] for idx in perm]
+            elif mode < 0.80:
+                # Multi-view strided rollout (stride in 2..8)
+                max_stride = max(1, min(8, (len(times) - 1) // max(1, tw - 1)))
+                stride = int(torch.randint(2, max_stride + 1, (1,)).item()) if max_stride > 1 else 1
+                span = (tw - 1) * stride + 1
+                start = int(torch.randint(0, max(1, len(times) - span + 1), (1,)).item())
+                window = times[start:start + span:stride][:tw]
             else:
-                stride = 1
-            span = (tw - 1) * stride + 1
-            start = int(torch.randint(0, max(1, len(times) - span + 1), (1,)).item())
-            window = times[start:start + span:stride][:tw]
+                # Fine contiguous local rollout (stride=1)
+                start = int(torch.randint(0, max(1, len(times) - tw + 1), (1,)).item())
+                window = times[start:start + tw]
         # Pick a random representative view per time step for multi-view consistency.
         window_samples = []
         for t in window:

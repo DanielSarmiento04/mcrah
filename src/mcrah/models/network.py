@@ -155,7 +155,9 @@ class MCRAH(nn.Module):
 
         if self.dilated is not None:
             h = self.dhgc(h, self.dilated.to(dev))
-        delta_pos, delta_rot, delta_scale, delta_sh = self.simgnn.heads.forward_full(h)
+        delta_pos, delta_rot, delta_scale, delta_sh, delta_op = (
+            self.simgnn.heads.forward_full(h)
+        )
 
         # Canonical boundary envelope near t=0: ensures the deformation field
         # smoothly anchors to the static reference cloud as t -> 0 while keeping
@@ -165,23 +167,20 @@ class MCRAH(nn.Module):
             t_abs = t_abs.view(1, 1)
         elif t_abs.dim() == 1:
             t_abs = t_abs.view(-1, 1)
-        min_env = 0.20 if self.training else 0.03
-        t_env = min_env + (1.0 - min_env) * (t_abs / 0.015).clamp(0.0, 1.0)
+        min_env = 0.20 if self.training else 0.02
+        t_env = min_env + (1.0 - min_env) * (t_abs / 0.012).clamp(0.0, 1.0)
         delta_pos = delta_pos * t_env
         if delta_scale is not None:
             delta_scale = delta_scale * t_env
         if delta_sh is not None:
             delta_sh = delta_sh * t_env
+        if delta_op is not None:
+            delta_op = delta_op * t_env
 
-        # Smooth autoregressive temporal inertia: lightly blend with previous
-        # step's detached displacement (0.90/0.10) to damp high-frequency ripples
-        # without introducing motion lag or positive-feedback drift across rollout steps.
-        prev_disp = (cloud.means - self._cloud_means).detach()
-        if prev_disp.abs().max() > 1e-7:
-            delta_pos = 0.90 * delta_pos + 0.10 * prev_disp * t_env
         new_cloud = apply_offsets(
             self.cloud, delta_pos, delta_rot,
             delta_scale=delta_scale, delta_sh=delta_sh,
+            delta_opacity=delta_op,
         )
         return RolloutStep(cloud=new_cloud, delta_pos=delta_pos,
                           delta_rot=delta_rot, membership=membership)

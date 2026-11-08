@@ -120,7 +120,7 @@ class FeatureEncoder(nn.Module):
         h = h * (1.0 + self.time_gamma(time_feat)) + self.time_mlp(time_feat)
         if ref_means is not None:
             disp = (cloud.means - ref_means).detach()
-            h = h + 0.05 * torch.tanh(self.disp_mlp(disp))
+            h = h + 0.02 * torch.tanh(self.disp_mlp(disp))
         return h
 
 
@@ -216,6 +216,15 @@ class OffsetHeads(nn.Module):
             nn.init.normal_(self.sh_head[-1].weight, std=1e-3)
             nn.init.zeros_(self.sh_head[-1].bias)
 
+        # Dynamic opacity modulation head: seals pinholes on stretching limbs
+        # and modulates cast-shadow density on floor plates.
+        self.opacity_head = nn.Sequential(
+            nn.Linear(dim, max(16, dim // 2)), nn.SiLU(),
+            nn.Linear(max(16, dim // 2), 1)
+        )
+        nn.init.normal_(self.opacity_head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.opacity_head[-1].bias)
+
     def forward_full(self, h: torch.Tensor):
         damp = self.damp_head(h)  # (N, 1) in (0, 1)
         delta_pos = (self.pos_scale * torch.tanh(self.pos_head(h))) * damp
@@ -227,19 +236,21 @@ class OffsetHeads(nn.Module):
         else:
             delta_rot = None
         if self.predict_scale:
-            delta_scale = (0.18 * torch.tanh(self.scale_head(h))) * damp
+            delta_scale = (0.22 * torch.tanh(self.scale_head(h))) * damp
             delta_scale = torch.nan_to_num(delta_scale, nan=0.0)
         else:
             delta_scale = None
         if self.predict_sh:
-            delta_sh = (0.18 * torch.tanh(self.sh_head(h))) * damp
+            delta_sh = (0.20 * torch.tanh(self.sh_head(h))) * damp
             delta_sh = torch.nan_to_num(delta_sh, nan=0.0)
         else:
             delta_sh = None
-        return delta_pos, delta_rot, delta_scale, delta_sh
+        delta_op = (0.60 * torch.tanh(self.opacity_head(h))) * damp
+        delta_op = torch.nan_to_num(delta_op, nan=0.0)
+        return delta_pos, delta_rot, delta_scale, delta_sh, delta_op
 
     def forward(self, h: torch.Tensor):
-        delta_pos, delta_rot, _, _ = self.forward_full(h)
+        delta_pos, delta_rot, _, _, _ = self.forward_full(h)
         return delta_pos, delta_rot
 
 
