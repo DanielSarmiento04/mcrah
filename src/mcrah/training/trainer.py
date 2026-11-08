@@ -419,7 +419,7 @@ class MCRAHTrainer:
         self.noise.step()
         if step_successful and self.state.stage == "joint":
             with torch.no_grad():
-                self.model._cloud_scales.data.clamp_(-7.5, -4.22)
+                self.model._cloud_scales.data.clamp_(-7.5, -3.10)
                 self.model._cloud_sh.data.clamp_(0.0, 1.0)
                 self.model._cloud_opacities.data.clamp_(-8.0, 5.0)
                 q = self.model._cloud_rotations.data

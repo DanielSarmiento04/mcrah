@@ -43,7 +43,14 @@ CVPR_BASELINES = {
 }
 
 
-def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, min_views: int = 12):
+def load_t0_views(
+    cfg: Config,
+    category: str,
+    device: str,
+    max_t: float = 0.06,
+    min_views: int = 12,
+    return_times: bool = False,
+):
     """Load early / near t=0 training views for static 3DGS initialization.
     
     A single 2D view is mathematically ill-posed for 3D reconstruction and causes
@@ -88,6 +95,8 @@ def load_t0_views(cfg: Config, category: str, device: str, max_t: float = 0.06, 
         views.append((s.image, s.c2w, s.intrinsics))
     times = [ds[i].time for i in selected]
     print(f"[{category}] static init: {len(views)} multi-view cameras (t in [{min(times):.3f}, {max(times):.3f}])")
+    if return_times:
+        return views, times
     return views
 
 
@@ -108,18 +117,19 @@ def run_category(cfg: Config, category: str, args) -> dict:
     else:
         max_t0 = getattr(args, "max_t0", 0.06)
         min_t0 = getattr(args, "min_t0_views", 12)
-        views = load_t0_views(
+        views, view_times = load_t0_views(
             cfg, category, device,
             max_t=max_t0,
             min_views=min_t0,
+            return_times=True,
         )
-        ds_tmp = DNeRFDataset(cfg, split="train", categories=[category])
-        n_core = max(6, min(min_t0, sum(1 for i in range(len(ds_tmp)) if ds_tmp[i].time <= max_t0)))
+        n_core = max(6, min(min_t0, sum(1 for t in view_times if t <= max_t0)))
         static_init = StaticGSInit(cfg, device=device)
         result = static_init.fit(
             views,
             iterations=args.static_iters,
             n_core_views=min(n_core, len(views)),
+            view_times=view_times,
         )
         cloud = result.cloud
         save_cloud(cloud, cloud_path)

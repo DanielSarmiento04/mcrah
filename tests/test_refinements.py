@@ -200,10 +200,10 @@ def test_canonical_appearance_joint_finetune(tiny_cloud, cfg):
 
 
 def test_gaussian_scale_clamp(tiny_cloud):
-    """Gaussian activation clamps scales to <= 0.015 for sharp bone geometry."""
+    """Gaussian activation clamps scales to <= 0.045 for multi-object generalization."""
     tiny_cloud.scales.data.fill_(1.0)  # very large pre-activation scale
     act = tiny_cloud.activated()
-    assert (act.scales <= 0.015 + 1e-6).all()
+    assert (act.scales <= 0.045 + 1e-6).all()
 
 
 def test_all_three_stages_train_step(tiny_cloud, cfg):

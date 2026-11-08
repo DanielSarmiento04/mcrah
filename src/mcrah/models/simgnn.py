@@ -158,16 +158,20 @@ class HGNNBlock(nn.Module):
 
 
 class OffsetHeads(nn.Module):
-    """Predicts Δposition (N,3) and Δrotation (N,4 quaternion delta).
+    """Predicts Δposition (N,3), Δrotation (N,4 quaternion delta), and optional
+    dynamic Δscale (N,3) and Δsh (N,3) shading/shadow residuals.
 
     Rotations are predicted as small perturbations and normalized; the
     identity delta is (1,0,0,0). Includes residual motion damping to prevent
     skeletal scatter and high-frequency drift across dynamic frames."""
 
     def __init__(self, dim: int, predict_rotation: bool = True,
-                 pos_scale: float = 0.20, motion_damping: float = 0.95):
+                 predict_scale: bool = True, predict_sh: bool = True,
+                 pos_scale: float = 0.48, motion_damping: float = 0.88):
         super().__init__()
         self.predict_rotation = predict_rotation
+        self.predict_scale = predict_scale
+        self.predict_sh = predict_sh
         self.pos_scale = pos_scale
         self.motion_damping = motion_damping
         self.pos_head = nn.Sequential(
@@ -195,7 +199,24 @@ class OffsetHeads(nn.Module):
             nn.init.normal_(self.rot_head[-1].weight, std=2e-3)
             nn.init.zeros_(self.rot_head[-1].bias)
 
-    def forward(self, h: torch.Tensor):
+        if predict_scale:
+            self.scale_head = nn.Sequential(
+                nn.Linear(dim, max(16, dim // 2)), nn.SiLU(),
+                nn.Linear(max(16, dim // 2), 3)
+            )
+            nn.init.normal_(self.scale_head[-1].weight, std=1e-3)
+            nn.init.zeros_(self.scale_head[-1].bias)
+
+        if predict_sh:
+            # Dynamic appearance / cast-shadow & specular shading residual
+            self.sh_head = nn.Sequential(
+                nn.Linear(dim, max(16, dim // 2)), nn.SiLU(),
+                nn.Linear(max(16, dim // 2), 3)
+            )
+            nn.init.normal_(self.sh_head[-1].weight, std=1e-3)
+            nn.init.zeros_(self.sh_head[-1].bias)
+
+    def forward_full(self, h: torch.Tensor):
         damp = self.damp_head(h)  # (N, 1) in (0, 1)
         delta_pos = (self.pos_scale * torch.tanh(self.pos_head(h))) * damp
         delta_pos = torch.nan_to_num(delta_pos, nan=0.0)
@@ -205,6 +226,20 @@ class OffsetHeads(nn.Module):
             delta_rot = torch.nan_to_num(delta_rot, nan=0.0)
         else:
             delta_rot = None
+        if self.predict_scale:
+            delta_scale = (0.18 * torch.tanh(self.scale_head(h))) * damp
+            delta_scale = torch.nan_to_num(delta_scale, nan=0.0)
+        else:
+            delta_scale = None
+        if self.predict_sh:
+            delta_sh = (0.18 * torch.tanh(self.sh_head(h))) * damp
+            delta_sh = torch.nan_to_num(delta_sh, nan=0.0)
+        else:
+            delta_sh = None
+        return delta_pos, delta_rot, delta_scale, delta_sh
+
+    def forward(self, h: torch.Tensor):
+        delta_pos, delta_rot, _, _ = self.forward_full(h)
         return delta_pos, delta_rot
 
 
@@ -260,8 +295,12 @@ class SIMGNN(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d)
         self.heads = OffsetHeads(
-            d, predict_rotation=cfg.model.predict_rotation,
-            pos_scale=pos_scale, motion_damping=damping,
+            d,
+            predict_rotation=cfg.model.predict_rotation,
+            predict_scale=getattr(cfg.model, "predict_scale", True),
+            predict_sh=getattr(cfg.model, "predict_sh", True),
+            pos_scale=pos_scale,
+            motion_damping=damping,
         )
 
     def encode(self, cloud, hypergraph, cluster_id: torch.Tensor,

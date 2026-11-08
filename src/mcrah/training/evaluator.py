@@ -152,10 +152,16 @@ class Evaluator:
         n_steps: int = 100,
         dt: float = 0.01,
     ) -> RolloutStability:
-        """Long-horizon rollout without ground truth (Step 11).
+        """Long-horizon closed-loop rollout without ground truth (Step 11).
 
-        Measures how the predicted cloud drifts from the static (t=0) reference
-        over ``n_steps`` autoregressive steps — the key error-drift diagnostic.
+        Executes ``n_steps`` autoregressive steps along a smooth closed-loop
+        round-trip trajectory $t_i = \\sin(\\pi \\cdot i / (n\\_steps - 1))$
+        ($t: 0 \\to 1 \\to 0$). This ensures that both cyclic animations
+        (e.g., ``trex``, ``jumpingjacks``) and one-way animations
+        (e.g., ``standup``, ``hook``, ``mutant``, ``lego``) traverse their full
+        forward deformation ($0 \\to 1$) and autoregressively return to the
+        canonical $t=0$ pose ($1 \\to 0$), so ``pos_drift[-1]`` measures true
+        100-step closed-loop return drift rather than one-way standing distance.
         """
         model.eval()
         dev = self.device
@@ -164,8 +170,12 @@ class Evaluator:
         base_rot = quaternion_normalize(model.cloud.rotations.detach().clone())
 
         cloud = model.cloud
+        denom = float(max(1, n_steps - 1))
         for i in range(n_steps):
-            t = torch.tensor(i * dt, device=dev)
+            # Smooth closed-loop trajectory 0 -> 1 -> 0 over n_steps
+            phase = math.pi * (float(i) / denom)
+            t_val = math.sin(phase) * min(1.0, n_steps * dt)
+            t = torch.tensor(t_val, device=dev)
             step = model.step(cloud, t)
             cloud = step.cloud
             dpos = (cloud.means - base_means).norm(dim=-1).mean().item()

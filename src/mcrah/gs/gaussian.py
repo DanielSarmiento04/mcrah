@@ -64,9 +64,9 @@ class GaussianCloud:
 
     def activated(self) -> "GaussianCloud":
         raw_scales = torch.exp(self.scales.clamp(-10.0, 2.0))
-        clamped_scales = raw_scales.clamp_max(0.015)
+        clamped_scales = raw_scales.clamp_max(0.045)
         # Straight-through estimator so gradients still flow to shrink any
-        # Gaussian whose pre-activation scale temporarily exceeds ln(0.015) ~ -4.20.
+        # Gaussian whose pre-activation scale temporarily exceeds ln(0.045) ~ -3.10.
         scales = raw_scales + (clamped_scales - raw_scales).detach()
         return GaussianCloud(
             means=self.means,

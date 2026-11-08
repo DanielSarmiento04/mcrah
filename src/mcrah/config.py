@@ -88,10 +88,10 @@ class ModelConfig:
     # Gaussian attribute prediction heads & motion damping
     predict_offset: bool = True       # Delta position
     predict_rotation: bool = True     # Delta rotation (as quaternion delta)
-    predict_scale: bool = False
-    predict_sh: bool = False
-    pos_scale: float = 0.30           # Max displacement scale in OffsetHeads
-    motion_damping: float = 0.85     # Residual motion damping factor
+    predict_scale: bool = True        # Dynamic scale adaptation for smooth vs thin surfaces
+    predict_sh: bool = True           # Dynamic appearance / cast-shadow & specular modulation
+    pos_scale: float = 0.48           # Max displacement scale in OffsetHeads (covers standup/hook)
+    motion_damping: float = 0.88     # Residual motion damping factor
     # Noise injection (rules.md Rule 4 / agent.md directive 4)
     noise_std: float = 1e-2
     noise_warmup_steps: int = 2_000

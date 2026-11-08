@@ -160,9 +160,10 @@ def _project_and_score_candidates(
         v_v = v[valid_idx]
 
         pix_colors = img[:, v_v, u_v].t()  # (M_valid, 3)
-        # Use 0.985 threshold so bright white/ivory bone (skull, ribs, tail tip)
-        # against the 1.0 white background is counted as foreground, not background.
-        is_fg = (pix_colors < 0.985).any(dim=-1)
+        # Use 0.997 threshold so bright white surfaces (bouncingballs circular
+        # floor plate, jumpingjacks white shirt/shoes, trex skull/ribs) against
+        # the 1.0 (255/255) white background are counted as foreground.
+        is_fg = (pix_colors < 0.997).any(dim=-1)
 
         fg_valid_idx = valid_idx[is_fg]
         bg_valid_idx = valid_idx[~is_fg]
@@ -206,8 +207,8 @@ def _carve_rays_from_pixels(
     cam_dist = float(t.norm().item())
     if cam_dist < 0.5:
         cam_dist = 4.0
-    z_min = max(0.2, cam_dist - 1.30)
-    z_max = cam_dist + 1.30
+    z_min = max(0.2, cam_dist - 1.48)
+    z_max = cam_dist + 1.48
     z_vals = torch.linspace(z_min, z_max, n_depths, device=device)
 
     # Candidate 3D points along each ray: (R_rays, n_depths, 3)
@@ -251,22 +252,21 @@ def seed_cloud_from_views(
 
     for img, c2w, K in views:
         H, W = img.shape[-2], img.shape[-1]
-        fg_mask = (img < 0.985).any(dim=0)
+        fg_mask = (img < 0.997).any(dim=0)
         ys, xs = torch.where(fg_mask)
         if ys.numel() < 16:
             continue
 
-        # Compute 2D spatial gradient + bone brightness weight so thin ribs,
-        # tail vertebrae, and skull edges receive 3x higher ray density than
-        # flat interior pedestal regions.
+        # Compute 2D spatial gradient + surface/bone weight so both high-contrast
+        # details (ribs, edges, joints) and bright foreground surfaces (white
+        # circular plate in bouncingballs, white bone) receive balanced ray density.
         grad_x = torch.zeros(H, W, device=device)
         grad_y = torch.zeros(H, W, device=device)
         grad_x[:, :-1] = (img[:, :, 1:] - img[:, :, :-1]).abs().mean(dim=0)
         grad_y[:-1, :] = (img[:, 1:, :] - img[:, :-1, :]).abs().mean(dim=0)
         edge_mag = (grad_x + grad_y)[ys, xs]
         pix_lum = img[:, ys, xs].mean(dim=0)
-        # Bright bone pixels (lum > 0.55) and high-edge pixels get higher weight
-        weights = 1.0 + 6.0 * edge_mag + 1.5 * (pix_lum > 0.55).float()
+        weights = 1.0 + 4.5 * edge_mag + 1.2 * (pix_lum > 0.55).float()
 
         n_sample = min(rays_per_view, ys.numel())
         sampled_idx = torch.multinomial(weights, n_sample, replacement=(ys.numel() < n_sample))
@@ -342,6 +342,7 @@ class StaticGSInit:
         init_points: Optional[torch.Tensor] = None,
         iterations: Optional[int] = None,
         n_core_views: Optional[int] = None,
+        view_times: Optional[List[float]] = None,
     ) -> StaticInitResult:
         """Fit a static cloud to ``views`` = list of (image, c2w, intrinsics).
 
@@ -444,32 +445,46 @@ class StaticGSInit:
         for it in range(iters):
             opt.zero_grad()
             total = 0.0
-            aux_w = 1.0 if it < int(iters * 0.45) else 0.30
-            w_sum = float(n_core_views) + aux_w * float(max(0, n_views - n_core_views))
-            w_sum = max(1.0, w_sum)
+            progress = it / max(1, iters - 1)
+            # Annealed exponential timestamp decay: early iterations weight all
+            # multi-view cameras evenly to triangulate 360-degree 3D depth; later
+            # iterations focus exponentially on t -> 0 so scenes with fast motion
+            # at t in [0.02, 0.12] (bouncingballs, jumpingjacks, hellwarrior, hook)
+            # converge sharply to the exact t=0 pose without ghosting.
+            alpha_t = 4.0 + 36.0 * max(0.0, (progress - 0.30) / 0.70)
+            aux_w = 1.0 if progress < 0.45 else 0.25
+            view_weights = []
+            for v_idx in range(n_views):
+                base_w = 1.0 if v_idx < n_core_views else aux_w
+                if view_times is not None and v_idx < len(view_times):
+                    t_v = max(0.0, float(view_times[v_idx]))
+                else:
+                    t_v = 0.05 * (v_idx / max(1, n_views - 1)) if n_views > 1 else 0.0
+                view_weights.append(base_w * math.exp(-alpha_t * t_v))
+            w_sum = max(1e-6, sum(view_weights))
+
             for v_idx, (img, c2w, K) in enumerate(views):
-                vw = 1.0 if v_idx < n_core_views else aux_w
+                vw = view_weights[v_idx]
                 out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
                 photo_loss = self.loss_fn(pred, tgt)
-                # Gentle opacity sparsity regularization during the first 65% of
-                # static init to clear floaters, then 0 so solid surfaces (stone
-                # pedestal and white bone) reach full opacity without background bleed.
-                if it < int(iters * 0.65):
-                    op_reg = 2.0e-5 * torch.sigmoid(cloud.opacities).mean()
-                else:
-                    op_reg = 0.0
-                loss = (photo_loss + op_reg) * (vw / w_sum)
+                # Gentle opacity sparsity during the first 55% to clear floaters,
+                # plus a soft excess-scale regularizer above -4.20 (0.015) so thin
+                # bones stay sharp while large smooth surfaces (floor plate, spheres,
+                # limbs) can expand up to 0.045 (-3.10) to fill pinholes.
+                op_reg = (1.5e-5 * torch.sigmoid(cloud.opacities).mean()) if progress < 0.55 else 0.0
+                scale_reg = 1.0e-4 * F.relu(cloud.scales - (-4.20)).mean()
+                loss = (photo_loss + op_reg + scale_reg) * (vw / w_sum)
                 loss.backward()
                 total = total + float(photo_loss.item()) * (vw / w_sum)
             opt.step()
             sched.step()
 
-            # Keep parameters physically bounded during optimization (strictly
-            # below -4.22 so scales never enter the 0.015 clamp ceiling).
+            # Keep parameters physically bounded during optimization (up to
+            # -3.10 ~ 0.045 so large smooth surfaces cover without pinholes).
             with torch.no_grad():
-                cloud.scales.data.clamp_(-7.5, -4.22)
+                cloud.scales.data.clamp_(-7.5, -3.10)
                 cloud.sh.data.clamp_(0.0, 1.0)
                 cloud.opacities.data.clamp_(-8.0, 5.0)
                 if (it + 1) in recycle_steps and cloud.n >= 500:
@@ -536,8 +551,8 @@ class StaticGSInit:
         for img, c2w, K in views:
             out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
             sq_err = ((out.image - img) ** 2).mean(dim=0)  # (H, W)
-            fg_mask = (img < 0.985).any(dim=0)
-            ys, xs = torch.where(fg_mask & (sq_err > 0.002))
+            fg_mask = (img < 0.997).any(dim=0)
+            ys, xs = torch.where(fg_mask & (sq_err > 0.0015))
             if ys.numel() < 8:
                 continue
             weights = (sq_err[ys, xs] ** 1.5).clamp_min(1e-8)
