@@ -62,31 +62,32 @@ def load_t0_views(
     """
     ds = DNeRFDataset(cfg, split="train", categories=[category])
     sorted_idxs = sorted(range(len(ds)), key=lambda i: ds[i].time)
-    target_min = max(6, min(min_views, round(len(ds) * 0.065)))
+    target_min = max(12, min(min_views, round(len(ds) * 0.24)))
     selected = [i for i in sorted_idxs if ds[i].time <= max_t]
     if len(selected) < target_min:
         selected = sorted_idxs[:min(len(sorted_idxs), target_min)]
     elif len(selected) > min_views + 2:
         selected = selected[:min_views + 2]
 
-    # Ensure 360-degree low-elevation side-view coverage across all 4 azimuth
-    # quadrants so overhead-only bias never leaves a vertical z-offset.
-    quads = {0: 0, 1: 0, 2: 0, 3: 0}
+    # Ensure 360-degree side-view coverage across all 8 azimuth octants so
+    # scenes with fewer frames (e.g., lego=50, hellwarrior=100, hook=100) still
+    # carve a tight multi-view 3D visual hull without mid-air floaters.
+    octants = {k: 0 for k in range(8)}
     for i in selected:
         pos = ds[i].c2w[:3, 3]
-        if abs(float(pos[2].item())) < 2.2:
-            q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
-            quads[q] += 1
+        if abs(float(pos[2].item())) < 3.2:
+            o = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.25 * math.pi)) % 8
+            octants[o] += 1
 
-    side_max_t = max(max_t, 0.125)
+    side_max_t = max(max_t, 0.22)
     for i in sorted_idxs:
         if ds[i].time > side_max_t or i in selected:
             continue
         pos = ds[i].c2w[:3, 3]
-        if abs(float(pos[2].item())) < 2.2:
-            q = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.5 * math.pi)) % 4
-            if quads[q] < 1:
-                quads[q] += 1
+        if abs(float(pos[2].item())) < 3.2:
+            o = int((math.atan2(float(pos[1].item()), float(pos[0].item())) + math.pi) / (0.25 * math.pi)) % 8
+            if octants[o] < 1:
+                octants[o] += 1
                 selected.append(i)
 
     views = []

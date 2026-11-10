@@ -144,7 +144,8 @@ class MCRAHTrainer:
         net_params = []
         cloud_pos_params = []
         cloud_scale_params = []
-        cloud_app_params = []
+        cloud_sh_params = []
+        cloud_op_params = []
         cloud_names = {
             "_cloud_means", "_cloud_rotations",
             "_cloud_scales", "_cloud_sh", "_cloud_opacities",
@@ -155,8 +156,10 @@ class MCRAHTrainer:
                     cloud_pos_params.append(p)
                 elif "_cloud_scales" in name:
                     cloud_scale_params.append(p)
-                elif "_cloud_sh" in name or "_cloud_opacities" in name:
-                    cloud_app_params.append(p)
+                elif "_cloud_sh" in name:
+                    cloud_sh_params.append(p)
+                elif "_cloud_opacities" in name:
+                    cloud_op_params.append(p)
                 elif not any(cn in name for cn in cloud_names):
                     net_params.append(p)
 
@@ -166,18 +169,25 @@ class MCRAHTrainer:
                 "params": net_params, "lr": lr, "weight_decay": cfg.train.weight_decay
             })
         if cloud_pos_params:
-            # Gentle precision-capped LR (<= 2.5e-5) so multi-view side cameras align
-            # 3D geometry without smearing dynamic bones into a temporal average.
+            # Allow multi-view cameras in joint stage to refine 3D canonical
+            # positions without smearing dynamic structures.
             param_groups.append({
-                "params": cloud_pos_params, "lr": min(lr * 0.12, 2.5e-5), "weight_decay": 0.0
+                "params": cloud_pos_params, "lr": min(lr * 0.35, 7.0e-5), "weight_decay": 0.0
             })
         if cloud_scale_params:
             param_groups.append({
-                "params": cloud_scale_params, "lr": min(lr * 2.5, 1e-3), "weight_decay": 0.0
+                "params": cloud_scale_params, "lr": min(lr * 12.0, 2.5e-3), "weight_decay": 0.0
             })
-        if cloud_app_params:
+        if cloud_sh_params:
             param_groups.append({
-                "params": cloud_app_params, "lr": min(lr * 2.5, 5e-4), "weight_decay": 0.0
+                "params": cloud_sh_params, "lr": min(lr * 10.0, 2.0e-3), "weight_decay": 0.0
+            })
+        if cloud_op_params:
+            # High opacity LR (up to 1.5e-2) in joint stage so mid-air floaters
+            # seen against white background from the 200 multi-view cameras are
+            # rapidly driven to zero opacity.
+            param_groups.append({
+                "params": cloud_op_params, "lr": min(lr * 75.0, 1.5e-2), "weight_decay": 0.0
             })
 
         if not param_groups:
@@ -229,24 +239,26 @@ class MCRAHTrainer:
         if len(times) <= tw:
             window = times
         else:
-            mode = float(torch.rand(1).item())
-            if mode < 0.45:
-                # Full-horizon sorted trajectory across [0, 1]: ensures early and
-                # late frames (t in [0.85, 1.0]) receive equal supervision and
-                # matches the multi-step evaluation trajectory across [0, 1].
-                perm = torch.randperm(len(times))[:tw].sort().values.tolist()
-                window = [times[idx] for idx in perm]
-            elif mode < 0.80:
-                # Multi-view strided rollout (stride in 2..8)
-                max_stride = max(1, min(8, (len(times) - 1) // max(1, tw - 1)))
-                stride = int(torch.randint(2, max_stride + 1, (1,)).item()) if max_stride > 1 else 1
-                span = (tw - 1) * stride + 1
-                start = int(torch.randint(0, max(1, len(times) - span + 1), (1,)).item())
-                window = times[start:start + span:stride][:tw]
+            # Mix fine contiguous rollouts (stride=1) with multi-view strided
+            # rollouts (stride in 2..8) so autoregressive steps span real camera
+            # baseline changes and match evaluation step intervals.
+            max_stride = max(1, min(8, (len(times) - 1) // max(1, tw - 1)))
+            if max_stride > 1 and float(torch.rand(1).item()) < 0.55:
+                stride = int(torch.randint(2, max_stride + 1, (1,)).item())
             else:
-                # Fine contiguous local rollout (stride=1)
-                start = int(torch.randint(0, max(1, len(times) - tw + 1), (1,)).item())
-                window = times[start:start + tw]
+                stride = 1
+            span = (tw - 1) * stride + 1
+            max_start = max(1, len(times) - span + 1)
+            # Bias 20% of windows to start near t=0 or end near t=1 so boundary
+            # frames receive uniform supervision.
+            r_mode = float(torch.rand(1).item())
+            if r_mode < 0.10:
+                start = 0
+            elif r_mode < 0.20:
+                start = max_start - 1
+            else:
+                start = int(torch.randint(0, max_start, (1,)).item())
+            window = times[start:start + span:stride][:tw]
         # Pick a random representative view per time step for multi-view consistency.
         window_samples = []
         for t in window:
@@ -350,20 +362,26 @@ class MCRAHTrainer:
                         self.topo_loss(memberships[i], memberships[i - 1])
                         for i in range(1, len(memberships))) / (len(memberships) - 1)
 
-        # Perceptual LPIPS loss (active during joint fine-tuning stage)
+        # Perceptual LPIPS loss + multi-view floater sparsity in joint stage
         lp_loss = pred.new_zeros((), dtype=torch.float32)
+        joint_op_reg = pred.new_zeros((), dtype=torch.float32)
         w_lpips = getattr(cfg.train, "w_lpips", 0.0)
-        if self.state.stage == "joint" and w_lpips > 0.0:
-            lpips_fn = self._get_lpips()
-            if lpips_fn is not None:
-                p_norm = (pred.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
-                t_norm = (target.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
-                lp_loss = lpips_fn(p_norm, t_norm).mean()
+        if self.state.stage == "joint":
+            # Mild opacity sparsity drives mid-air floaters (seen against white
+            # background across the 200 multi-view cameras) to zero opacity.
+            joint_op_reg = 1.5e-5 * torch.sigmoid(self.model._cloud_opacities).mean()
+            if w_lpips > 0.0:
+                lpips_fn = self._get_lpips()
+                if lpips_fn is not None:
+                    p_norm = (pred.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
+                    t_norm = (target.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
+                    lp_loss = lpips_fn(p_norm, t_norm).mean()
 
         loss = (photo + cfg.train.w_rel_l2 * rel + pde
                 + mc.rigidity_weight * rig
                 + mc.topology_smoothness_weight * topo
-                + w_lpips * lp_loss)
+                + w_lpips * lp_loss
+                + joint_op_reg)
         metrics = {
             "loss": float(loss.item()),
             "photo": float(photo.item()),
@@ -428,7 +446,10 @@ class MCRAHTrainer:
             with torch.no_grad():
                 self.model._cloud_scales.data.clamp_(-7.5, -3.10)
                 self.model._cloud_sh.data.clamp_(0.0, 1.0)
-                self.model._cloud_opacities.data.clamp_(-8.0, 5.0)
+                # Suppress transparent mid-air floaters (logit < -3.0 -> -8.0)
+                op_data = self.model._cloud_opacities.data
+                op_data.clamp_(-8.0, 5.0)
+                op_data[op_data < -3.0] = -8.0
                 q = self.model._cloud_rotations.data
                 self.model._cloud_rotations.data.copy_(
                     q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)

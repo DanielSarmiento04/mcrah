@@ -155,7 +155,7 @@ class MCRAH(nn.Module):
 
         if self.dilated is not None:
             h = self.dhgc(h, self.dilated.to(dev))
-        delta_pos, delta_rot, delta_scale, delta_sh, delta_op = (
+        delta_pos, delta_rot, delta_scale, delta_sh = (
             self.simgnn.heads.forward_full(h)
         )
 
@@ -174,13 +174,10 @@ class MCRAH(nn.Module):
             delta_scale = delta_scale * t_env
         if delta_sh is not None:
             delta_sh = delta_sh * t_env
-        if delta_op is not None:
-            delta_op = delta_op * t_env
 
         new_cloud = apply_offsets(
             self.cloud, delta_pos, delta_rot,
             delta_scale=delta_scale, delta_sh=delta_sh,
-            delta_opacity=delta_op,
         )
         return RolloutStep(cloud=new_cloud, delta_pos=delta_pos,
                           delta_rot=delta_rot, membership=membership)

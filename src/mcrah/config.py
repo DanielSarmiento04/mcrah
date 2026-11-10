@@ -70,8 +70,8 @@ class HypergraphConfig:
 @dataclass
 class MCRAHLossConfig:
     """Loss weights for the MCRAH novel-module regularizers."""
-    rigidity_weight: float = 0.02    # quasi-rigid-body prior
-    topology_smoothness_weight: float = 1e-3  # temporal membership stability
+    rigidity_weight: float = 2e-3    # quasi-rigid-body prior (gentle so rotating limbs aren't over-damped)
+    topology_smoothness_weight: float = 2e-4  # temporal membership stability
 
 
 @dataclass
@@ -96,9 +96,9 @@ class ModelConfig:
     noise_std: float = 1e-2
     noise_warmup_steps: int = 2_000
     # PDE temporal smoothness weight (agent.md: Neural Physics Operators).
-    pde_weight: float = 1e-2
+    pde_weight: float = 1e-3
     # Relative L2 regularization weight (rules.md Rule 4)
-    rel_l2_weight: float = 1e-3
+    rel_l2_weight: float = 5e-4
     # Activation (0.0 dropout for sub-pixel coordinate regression precision)
     dropout: float = 0.0
 
@@ -124,7 +124,7 @@ class TrainConfig:
     # Loss weights
     w_l1: float = 0.8
     w_ssim: float = 0.2
-    w_rel_l2: float = 0.005
+    w_rel_l2: float = 0.0005
     w_lpips: float = 0.05  # perceptual loss weight (activated in joint stage)
     # Eval
     eval_every: int = 2_000

@@ -311,7 +311,7 @@ def seed_cloud_from_views(
 
         selected_pts = valid_pts[sel_idx] + torch.randn(n_gaussians, 3, device=device) * 0.0012
         selected_colors = valid_cols[sel_idx].clamp(0.0, 1.0)
-        selected_opacities = torch.full((n_gaussians, 1), 1.1, device=device)
+        selected_opacities = torch.full((n_gaussians, 1), 0.85, device=device)
         return selected_pts, selected_colors, selected_opacities
 
     pts = torch.randn(n_gaussians, 3, device=device) * 0.35
@@ -399,9 +399,10 @@ class StaticGSInit:
                 cloud.opacities.data.copy_(init_opacities)
             else:
                 cloud.opacities.data.fill_(-0.5)
-            # Start at -4.55 (exp(-4.55) ~ 0.0105, ~4px radius) so splats form
-            # watertight surfaces on limbs/plates while remaining sharp on ribs.
-            cloud.scales.data.clamp_(-5.6, -4.45)
+            # Start at -4.85 (exp(-4.85) ~ 0.0078, ~3px radius) so fine ribs,
+            # lego studs, and joints remain sharp while large smooth surfaces
+            # can expand up to -3.10 (0.045) via gradients.
+            cloud.scales.data.clamp_(-6.0, -4.75)
 
         # Parameter groups with per-attribute learning rates (3DGS convention,
         # scaled by D-NeRF camera radius ~3.5x).
@@ -576,8 +577,8 @@ class StaticGSInit:
         target_idx = dead_idx[:count]
         cloud.means.data[target_idx] = new_pts[:count] + torch.randn_like(new_pts[:count]) * 0.0008
         cloud.sh.data[target_idx] = new_cols[:count].clamp(0.0, 1.0)
-        cloud.opacities.data[target_idx] = 1.20
-        cloud.scales.data[target_idx] = -4.65
+        cloud.opacities.data[target_idx] = 0.85
+        cloud.scales.data[target_idx] = -5.15
 
         # Reset Adam momentum (exp_avg, exp_avg_sq) for recycled Gaussians (3DGS convention)
         if opt is not None:
