@@ -115,8 +115,8 @@ class TrainConfig:
     lr_decay: float = 0.98
     # Stage-specific initial learning rates
     lr_dense: float = 1e-3
-    lr_farfield: float = 5e-4
-    lr_joint: float = 2e-4
+    lr_farfield: float = 7e-4
+    lr_joint: float = 6e-4
     lr_min: float = 1e-6
     use_cosine_scheduler: bool = True
     weight_decay: float = 1e-5

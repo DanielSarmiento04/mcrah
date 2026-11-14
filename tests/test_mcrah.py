@@ -187,3 +187,24 @@ def test_mcrah_gradient_flows_through_gate(tiny_cloud, cfg):
         for p in model.mcrah.gate.parameters()
     )
     assert has_grad, "No gradient reached the MCRAH gate parameters"
+
+
+def test_se3_hyperedge_articulator(tiny_cloud):
+    """HyperedgeSE3Articulator computes factorized O(N*E) SE(3) LBS displacements & gradients."""
+    from mcrah.models.mcrah import HyperedgeSE3Articulator
+
+    hg = build_hypergraph_from_features(tiny_cloud.means, k=8, seed=0)
+    centroids_0 = compute_centroids(tiny_cloud.means, hg.assignment, hg.n_edges)
+    M = torch.nn.functional.one_hot(hg.assignment, num_classes=hg.n_edges).float()
+    h = torch.randn(tiny_cloud.n, 32, requires_grad=True)
+
+    art = HyperedgeSE3Articulator(feat_dim=32)
+    dp_se3, rv_se3 = art(h, M, tiny_cloud.means, centroids_0)
+    assert dp_se3.shape == (tiny_cloud.n, 3)
+    assert rv_se3.shape == (tiny_cloud.n, 3)
+    assert torch.isfinite(dp_se3).all()
+    assert torch.isfinite(rv_se3).all()
+
+    loss = (dp_se3 ** 2).sum() + (rv_se3 ** 2).sum()
+    loss.backward()
+    assert h.grad is not None and torch.isfinite(h.grad).all()

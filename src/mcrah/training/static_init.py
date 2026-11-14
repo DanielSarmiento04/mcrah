@@ -454,26 +454,44 @@ class StaticGSInit:
             # Annealed exponential timestamp decay: early iterations weight all
             # multi-view cameras evenly to triangulate 360-degree 3D depth; later
             # iterations focus exponentially on t -> 0 so scenes with fast motion
-            # at t in [0.02, 0.12] (bouncingballs, jumpingjacks, hellwarrior, hook)
+            # at t in [0.02, 0.22] (lego scoop, bouncingballs, jumpingjacks)
             # converge sharply to the exact t=0 pose without ghosting.
-            alpha_t = 4.0 + 36.0 * max(0.0, (progress - 0.30) / 0.70)
-            aux_w = 1.0 if progress < 0.45 else 0.25
+            alpha_t = 4.0 + 70.0 * max(0.0, (progress - 0.25) / 0.75)
+            aux_w = 1.0 if progress < 0.40 else 0.20
             view_weights = []
+            resolved_times = []
             for v_idx in range(n_views):
                 base_w = 1.0 if v_idx < n_core_views else aux_w
                 if view_times is not None and v_idx < len(view_times):
                     t_v = max(0.0, float(view_times[v_idx]))
                 else:
                     t_v = 0.05 * (v_idx / max(1, n_views - 1)) if n_views > 1 else 0.0
+                resolved_times.append(t_v)
                 view_weights.append(base_w * math.exp(-alpha_t * t_v))
             w_sum = max(1e-6, sum(view_weights))
 
             for v_idx, (img, c2w, K) in enumerate(views):
                 vw = view_weights[v_idx]
+                t_v = resolved_times[v_idx]
                 out = render(cloud, c2w, K, width=W, height=H, bg_color=bg)
                 pred = out.image.unsqueeze(0)  # (1,3,H,W)
                 tgt = img.unsqueeze(0)
-                photo_loss = self.loss_fn(pred, tgt)
+                # Motion-outlier gating for views with t_v > 0.025 after coarse
+                # 3D hull convergence: static pixels (e.g. lego baseplate/cab,
+                # background) keep full 360-degree supervision, while pixels where
+                # an articulated part moved between t=0 and t_v are downweighted
+                # so they never create ghost duplicates at t=0.
+                if progress > 0.22 and t_v > 0.025:
+                    with torch.no_grad():
+                        pix_err = (pred.detach() - tgt).abs().mean(dim=1, keepdim=True)
+                        # Always supervise empty background (tgt >= 0.995) to prune floaters
+                        is_bg_tgt = (tgt >= 0.995).all(dim=1, keepdim=True)
+                        conf = 1.0 / (1.0 + (t_v / 0.025) * ((pix_err / 0.08) ** 2))
+                        conf = torch.where(is_bg_tgt, torch.ones_like(conf), conf)
+                    tgt_eff = conf * tgt + (1.0 - conf) * pred.detach()
+                else:
+                    tgt_eff = tgt
+                photo_loss = self.loss_fn(pred, tgt_eff)
                 # Gentle opacity sparsity during the first 55% to clear floaters,
                 # plus a soft excess-scale regularizer above -4.20 (0.015) so thin
                 # bones stay sharp while large smooth surfaces (floor plate, spheres,

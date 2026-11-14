@@ -204,11 +204,15 @@ class MCRAHTrainer:
         self._opt = self._build_optimizer(stage)
         if getattr(self.cfg.train, "use_cosine_scheduler", True):
             steps = total_steps or self.cfg.train.iterations
+            self._stage_total_steps = max(1, int(steps))
+            self._stage_step = 0
             lr_min = getattr(self.cfg.train, "lr_min", 1e-6)
             self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self._opt, T_max=max(1, steps), eta_min=lr_min
             )
         else:
+            self._stage_total_steps = max(1, int(total_steps or self.cfg.train.iterations))
+            self._stage_step = 0
             self._scheduler = None
 
         if self._use_amp:
@@ -362,20 +366,20 @@ class MCRAHTrainer:
                         self.topo_loss(memberships[i], memberships[i - 1])
                         for i in range(1, len(memberships))) / (len(memberships) - 1)
 
-        # Perceptual LPIPS loss + multi-view floater sparsity in joint stage
+        # Perceptual LPIPS loss + multi-view floater sparsity in farfield/joint stages
         lp_loss = pred.new_zeros((), dtype=torch.float32)
         joint_op_reg = pred.new_zeros((), dtype=torch.float32)
         w_lpips = getattr(cfg.train, "w_lpips", 0.0)
-        if self.state.stage == "joint":
+        if self.state.stage in ("farfield", "joint"):
             # Mild opacity sparsity drives mid-air floaters (seen against white
             # background across the 200 multi-view cameras) to zero opacity.
             joint_op_reg = 1.5e-5 * torch.sigmoid(self.model._cloud_opacities).mean()
-            if w_lpips > 0.0:
-                lpips_fn = self._get_lpips()
-                if lpips_fn is not None:
-                    p_norm = (pred.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
-                    t_norm = (target.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
-                    lp_loss = lpips_fn(p_norm, t_norm).mean()
+        if self.state.stage == "joint" and w_lpips > 0.0:
+            lpips_fn = self._get_lpips()
+            if lpips_fn is not None:
+                p_norm = (pred.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
+                t_norm = (target.float() * 2.0 - 1.0).clamp(-1.0, 1.0)
+                lp_loss = lpips_fn(p_norm, t_norm).mean()
 
         loss = (photo + cfg.train.w_rel_l2 * rel + pde
                 + mc.rigidity_weight * rig
@@ -442,7 +446,8 @@ class MCRAHTrainer:
                 step_successful = False
 
         self.noise.step()
-        if step_successful and self.state.stage == "joint":
+        self._stage_step = getattr(self, "_stage_step", 0) + 1
+        if step_successful and self.state.stage in ("farfield", "joint"):
             with torch.no_grad():
                 self.model._cloud_scales.data.clamp_(-7.5, -3.10)
                 self.model._cloud_sh.data.clamp_(0.0, 1.0)
@@ -454,6 +459,17 @@ class MCRAHTrainer:
                 self.model._cloud_rotations.data.copy_(
                     q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
                 )
+                # Dynamic Gaussian Recycling at 25% and 55% of joint stage:
+                # reinvest dead floater Gaussians directly into active moving
+                # foreground structures (e.g. lego scoop, bouncing balls, limbs).
+                stg_tot = getattr(self, "_stage_total_steps", 0)
+                if (
+                    self.state.stage == "joint"
+                    and stg_tot >= 200
+                    and self._stage_step in (int(stg_tot * 0.25), int(stg_tot * 0.55))
+                    and self.model.cloud.n >= 500
+                ):
+                    self._recycle_dead_gaussians(deltas)
                 if self.model.mcrah is not None:
                     self.model.mcrah.means_0.copy_(self.model._cloud_means.detach())
         if self._scheduler is not None and step_successful:
@@ -465,6 +481,73 @@ class MCRAHTrainer:
             self.state.best_loss = metrics["loss"]
         self.state.history.append(metrics)
         return metrics
+
+    @torch.no_grad()
+    def _recycle_dead_gaussians(self, deltas: List[torch.Tensor]) -> None:
+        """Clone transparent/dead Gaussians (opacities <= -2.8) onto active
+        foreground Gaussians with the largest dynamic motion/gradient."""
+        op_flat = self.model._cloud_opacities.data.squeeze(-1)
+        dead_mask = op_flat <= -2.8
+        active_mask = op_flat > 0.2
+        n_dead = int(dead_mask.sum().item())
+        n_active = int(active_mask.sum().item())
+        if n_dead < 8 or n_active < 32:
+            return
+
+        dead_idx = torch.where(dead_mask)[0]
+        active_idx = torch.where(active_mask)[0]
+        max_recycle = min(n_dead, max(64, self.model.cloud.n // 10))
+        dead_idx = dead_idx[:max_recycle]
+
+        # Score active Gaussians by dynamic motion magnitude + scale + grad norm
+        if deltas:
+            disp_mag = torch.stack([d.detach().norm(dim=-1) for d in deltas], dim=0).mean(dim=0)
+        else:
+            disp_mag = torch.zeros_like(op_flat)
+        grad_mag = (
+            self.model._cloud_means.grad.detach().norm(dim=-1)
+            if self.model._cloud_means.grad is not None
+            else torch.zeros_like(op_flat)
+        )
+        scores = (0.1 + disp_mag[active_idx] * 5.0 + grad_mag[active_idx] * 20.0).clamp_min(1e-4)
+        src_local = torch.multinomial(scores, dead_idx.numel(), replacement=True)
+        src_idx = active_idx[src_local]
+
+        self.model._cloud_means.data[dead_idx] = (
+            self.model._cloud_means.data[src_idx]
+            + torch.randn_like(self.model._cloud_means.data[src_idx]) * 0.0025
+        )
+        self.model._cloud_sh.data[dead_idx] = self.model._cloud_sh.data[src_idx].clone()
+        self.model._cloud_rotations.data[dead_idx] = self.model._cloud_rotations.data[src_idx].clone()
+        self.model._cloud_scales.data[dead_idx] = (
+            self.model._cloud_scales.data[src_idx] - 0.20
+        ).clamp_(-7.0, -4.30)
+        self.model._cloud_opacities.data[dead_idx] = 0.85
+
+        # Also copy cluster assignment so recycled Gaussians inherit their parent's hyperedge
+        self.model.cluster_id[dead_idx] = self.model.cluster_id[src_idx]
+        if self.model.mcrah is not None:
+            from ..models.mcrah import compute_centroids
+            self.model.mcrah.hypergraph.assignment_0[dead_idx] = (
+                self.model.mcrah.hypergraph.assignment_0[src_idx]
+            )
+            self.model.mcrah.means_0.copy_(self.model._cloud_means.detach())
+            new_c0 = compute_centroids(
+                self.model.mcrah.means_0,
+                self.model.mcrah.hypergraph.assignment_0,
+                self.model.mcrah.hypergraph.n_edges,
+            )
+            self.model.mcrah.centroid_0.copy_(new_c0)
+
+        # Reset Adam momentum for recycled indices
+        for group in self._opt.param_groups:
+            for p in group["params"]:
+                st = self._opt.state.get(p)
+                if st is not None and p.shape[0] == self.model.cloud.n:
+                    if "exp_avg" in st:
+                        st["exp_avg"][dead_idx] = 0.0
+                    if "exp_avg_sq" in st:
+                        st["exp_avg_sq"][dead_idx] = 0.0
 
     @torch.no_grad()
     def eval_step(self, samples: List[SceneSample]) -> Dict[str, float]:

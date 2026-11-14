@@ -36,10 +36,14 @@ where D_v = diag(M 1_E), D_e = diag(M^T 1_N), and M ∈ [0,1]^{N×E}.
 from __future__ import annotations
 
 from typing import Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..gs.gaussian import rotation_to_matrix
+from .simgnn import axis_angle_to_quaternion
 
 
 # --------------------------------------------------------------------------- #
@@ -77,6 +81,15 @@ class MCRAHGate(nn.Module):
             nn.SiLU(),
             nn.Linear(feat_dim, feat_dim),
         )
+        # Temporal conditioning so soft membership adapts to target time t
+        # even at step 0 when means_t == means_0.
+        self.time_enc = nn.Sequential(
+            nn.Linear(5, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+        nn.init.zeros_(self.time_enc[-1].weight)
+        nn.init.zeros_(self.time_enc[-1].bias)
         self.register_buffer("prior_logit", torch.tensor(3.0))
 
     def forward(
@@ -85,6 +98,7 @@ class MCRAHGate(nn.Module):
         means_0: torch.Tensor,           # (N, 3) reference (t=0) positions
         assignment_0: torch.Tensor,      # (N,) long, initial cluster id
         centroid_0: torch.Tensor,        # (E, 3) reference centroids
+        time: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns M (N, E) soft membership in [0, 1], rows sum to 1."""
         N = means_t.shape[0]
@@ -97,6 +111,18 @@ class MCRAHGate(nn.Module):
         node_disp = torch.tanh((means_t - means_0) * 5.0) * 0.2  # (N, 3)
         node_feat = self.node_enc(
             torch.cat([node_disp, means_0], dim=-1))       # (N, D)
+
+        if time is not None:
+            t_val = time.to(device=means_t.device, dtype=means_t.dtype).reshape(-1)
+            t_s = t_val[:1] if t_val.numel() > 0 else torch.zeros(1, device=means_t.device, dtype=means_t.dtype)
+            t_emb = torch.cat([
+                t_s,
+                torch.sin(t_s * math.pi),
+                torch.cos(t_s * math.pi),
+                torch.sin(t_s * 2.0 * math.pi),
+                torch.cos(t_s * 2.0 * math.pi),
+            ], dim=-1).unsqueeze(0)  # (1, 5)
+            node_feat = node_feat * (1.0 + 0.25 * torch.tanh(self.time_enc(t_emb)))
 
         # Cluster displacement + reference centroid.
         cluster_disp = torch.tanh((centroid_t - centroid_0) * 5.0) * 0.2  # (E, 3)
@@ -265,12 +291,83 @@ class TopologySmoothnessLoss(nn.Module):
 # --------------------------------------------------------------------------- #
 # Full MCRAH core module
 # --------------------------------------------------------------------------- #
+class HyperedgeSE3Articulator(nn.Module):
+    """Per-hyperedge SE(3) rigid-body articulation (Soft Hypergraph LBS).
+
+    Pools refined node features h (N, D) into hyperedge features h_e (E, D)
+    via the soft membership M (N, E), predicts a per-hyperedge 3D rotation
+    R_e in SO(3) around the canonical cluster pivot c_e^0 and a 3D translation
+    b_e, and blends the articulated rigid displacement across nodes in O(N*E):
+
+        Delta_x_i^{SE3} = sum_e M_{ie} [ (R_e - I)(x_i^0 - c_e^0) + b_e ]
+    """
+
+    def __init__(self, feat_dim: int = 64, max_trans: float = 0.35, max_rot: float = 0.85):
+        super().__init__()
+        self.max_trans = max_trans
+        self.max_rot = max_rot
+        self.edge_mlp = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, 6),  # 3 translation + 3 axis-angle rotation
+        )
+        nn.init.normal_(self.edge_mlp[-1].weight, std=1e-3)
+        nn.init.zeros_(self.edge_mlp[-1].bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,            # (N, D) post-DHGC node features
+        membership: torch.Tensor,   # (N, E) soft hyperedge membership
+        means_0: torch.Tensor,      # (N, 3) canonical t=0 node positions
+        centroid_0: torch.Tensor,   # (E, 3) canonical t=0 hyperedge pivots
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (delta_pos_se3 (N,3), rotvec_se3 (N,3))."""
+        orig_dtype = h.dtype
+        h_f = h.float()
+        M = membership.float()      # (N, E)
+        x0 = means_0.float()        # (N, 3)
+        c0 = centroid_0.float()     # (E, 3)
+
+        # 1. Pool node features into hyperedges: (E, N) @ (N, D) -> (E, D)
+        d_e = M.sum(dim=0).clamp_min(1.0).unsqueeze(-1)  # (E, 1)
+        h_edge = (M.t() @ h_f) / d_e                     # (E, D)
+
+        # 2. Predict per-hyperedge SE(3) parameters (b_e, omega_e)
+        raw_se3 = self.edge_mlp(h_edge)                  # (E, 6)
+        b_e = self.max_trans * torch.tanh(raw_se3[:, :3])      # (E, 3)
+        omega_e = self.max_rot * torch.tanh(raw_se3[:, 3:])    # (E, 3)
+
+        # 3. Convert axis-angle omega_e -> rotation matrix R_e (E, 3, 3)
+        q_e = axis_angle_to_quaternion(omega_e)          # (E, 4)
+        R_e = rotation_to_matrix(q_e)                    # (E, 3, 3)
+        eye = torch.eye(3, device=h.device, dtype=torch.float32).unsqueeze(0)
+        A_e = R_e - eye                                  # (E, 3, 3)
+
+        # 4. Factorized O(N*E) Linear Blend Skinning:
+        # sum_e M_{ie} [ A_e (x_i^0 - c_e^0) + b_e ] = (sum_e M_{ie} A_e) x_i^0 + sum_e M_{ie} (b_e - A_e c_e^0)
+        Ac0 = torch.bmm(A_e, c0.unsqueeze(-1)).squeeze(-1)     # (E, 3)
+        b_tilde_e = b_e - Ac0                                  # (E, 3)
+
+        A_node = (M @ A_e.reshape(-1, 9)).reshape(-1, 3, 3)    # (N, 3, 3)
+        b_node = M @ b_tilde_e                                 # (N, 3)
+
+        delta_pos_se3 = torch.bmm(A_node, x0.unsqueeze(-1)).squeeze(-1) + b_node
+        rotvec_se3 = M @ omega_e                               # (N, 3)
+
+        delta_pos_se3 = torch.nan_to_num(delta_pos_se3, nan=0.0).to(orig_dtype)
+        rotvec_se3 = torch.nan_to_num(rotvec_se3, nan=0.0).to(orig_dtype)
+        return delta_pos_se3, rotvec_se3
+
+
 class MCRAHCore(nn.Module):
     """Motion-Coherent Rigidity-Adaptive Hypergraph core.
 
-    Wraps the gate + adaptive hypergraph. At each autoregressive step, the
-    gate recomputes soft membership from the current deformation state, and
-    the adaptive hypergraph propagates features through it.
+    Wraps the gate + adaptive hypergraph + SE(3) hyperedge articulator.
+    At each autoregressive step, the gate recomputes soft membership from the
+    current deformation state, the adaptive hypergraph propagates features
+    through it, and the SE(3) articulator computes rigid-body rotations and
+    translations around each hyperedge's canonical pivot.
 
     The reference (t=0) centroids and assignment are fixed from Phase 1/2.
     """
@@ -288,6 +385,7 @@ class MCRAHCore(nn.Module):
         self.gate = MCRAHGate(feat_dim=feat_dim, n_clusters=n_clusters, tau=tau)
         self.hypergraph = AdaptiveHypergraph(
             assignment_0, n_clusters, adaptive=adaptive)
+        self.articulator = HyperedgeSE3Articulator(feat_dim=feat_dim)
         # Store reference centroids (computed externally from t=0 means).
         self.register_buffer("centroid_0", torch.zeros(n_clusters, 3), persistent=False)
         self.register_buffer("means_0", torch.zeros(assignment_0.shape[0], 3),
@@ -301,6 +399,7 @@ class MCRAHCore(nn.Module):
     def update_membership(
         self,
         means_t: torch.Tensor,
+        time: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Recompute soft membership from the current positions.
 
@@ -316,9 +415,15 @@ class MCRAHCore(nn.Module):
             return M
 
         M = self.gate(means_t, self.means_0,
-                       self.hypergraph.assignment_0, self.centroid_0)
+                       self.hypergraph.assignment_0, self.centroid_0,
+                       time=time)
         self.hypergraph.set_membership(M)
         return M
+
+    def articulate(self, h: torch.Tensor, membership: torch.Tensor
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-node SE(3) articulated displacement & rotation vector."""
+        return self.articulator(h, membership, self.means_0, self.centroid_0)
 
     def propagate(self, x: torch.Tensor, edge_weight: Optional[torch.Tensor] = None
                   ) -> torch.Tensor:
@@ -328,6 +433,7 @@ class MCRAHCore(nn.Module):
     def to(self, device) -> "MCRAHCore":
         self.gate = self.gate.to(device)
         self.hypergraph = self.hypergraph.to(device)
+        self.articulator = self.articulator.to(device)
         self.centroid_0 = self.centroid_0.to(device)
         self.means_0 = self.means_0.to(device)
         return self

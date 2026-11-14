@@ -28,8 +28,8 @@ import torch
 import torch.nn as nn
 
 from ..config import Config
-from ..gs.gaussian import GaussianCloud, apply_offsets
-from .simgnn import SIMGNN
+from ..gs.gaussian import GaussianCloud, apply_offsets, quaternion_multiply
+from .simgnn import SIMGNN, axis_angle_to_quaternion
 from .dhgc import DHGC
 from .hypergraph import (
     Hypergraph, DilatedStructure,
@@ -139,7 +139,7 @@ class MCRAH(nn.Module):
 
         if self.use_mcrah and self.mcrah is not None:
             self.mcrah = self.mcrah.to(dev)
-            membership = self.mcrah.update_membership(cloud.means)
+            membership = self.mcrah.update_membership(cloud.means, time=time)
             # Propagate through the adaptive (soft) hypergraph with local-global skip.
             h0 = self.simgnn.encoder(cloud, self.cluster_id, time,
                                      ref_means=self._cloud_means)
@@ -158,6 +158,16 @@ class MCRAH(nn.Module):
         delta_pos, delta_rot, delta_scale, delta_sh = (
             self.simgnn.heads.forward_full(h)
         )
+
+        # SE(3) Hyperedge Articulation (Soft Hypergraph Linear Blend Skinning):
+        # combines per-hyperedge rigid rotation around cluster pivots c_e^0 +
+        # cluster translation b_e with fine per-node non-rigid residuals.
+        if self.use_mcrah and self.mcrah is not None and membership is not None:
+            delta_pos_se3, rotvec_se3 = self.mcrah.articulate(h, membership)
+            delta_pos = delta_pos + delta_pos_se3
+            if delta_rot is not None:
+                q_se3 = axis_angle_to_quaternion(rotvec_se3)
+                delta_rot = quaternion_multiply(q_se3, delta_rot)
 
         # Canonical boundary envelope near t=0: ensures the deformation field
         # smoothly anchors to the static reference cloud as t -> 0 while keeping
@@ -227,12 +237,12 @@ class MCRAH(nn.Module):
         if self.use_mcrah and self.mcrah is not None:
             for p in self.mcrah.parameters():
                 p.requires_grad = stage in ("dense", "joint")
-        # In joint stage, allow canonical 3D geometry & appearance to fine-tune
-        # across all 200 multi-view training cameras with a precision-capped LR.
-        is_joint = (stage == "joint")
+        # In farfield & joint stages, allow canonical 3D geometry & appearance
+        # to refine across all 200 multi-view training cameras.
+        refine_cloud = stage in ("farfield", "joint")
         for attr in ("_cloud_means", "_cloud_rotations", "_cloud_scales", "_cloud_sh", "_cloud_opacities"):
             if hasattr(self, attr):
-                getattr(self, attr).requires_grad = is_joint
+                getattr(self, attr).requires_grad = refine_cloud
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)

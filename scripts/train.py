@@ -146,19 +146,31 @@ def run_category(cfg: Config, category: str, args) -> dict:
 
     stages = ["dense", "farfield", "joint"] if not args.stage else [args.stage]
     iters = args.iterations
+    if not args.stage and len(stages) == 3:
+        # Allocate the exact same 3 * iters total step budget with a longer
+        # end-to-end joint stage (where SIMGNN + DHGC + SE(3) articulation +
+        # canonical 3D cloud + LPIPS optimize simultaneously).
+        dense_iters = max(1, int(round(iters * 0.90)))
+        far_iters = max(1, int(round(iters * 0.35)))
+        joint_iters = max(1, 3 * iters - dense_iters - far_iters)
+        stage_iters_map = {"dense": dense_iters, "farfield": far_iters, "joint": joint_iters}
+    else:
+        stage_iters_map = {s: iters for s in stages}
+
     for stage in stages:
-        print(f"\n[{category}] training stage: {stage} ({iters} iters)")
-        trainer.set_stage(stage, total_steps=iters)
-        for it in range(iters):
+        s_iters = stage_iters_map[stage]
+        print(f"\n[{category}] training stage: {stage} ({s_iters} iters)")
+        trainer.set_stage(stage, total_steps=s_iters)
+        for it in range(s_iters):
             # Pass full sample pool so _sample_window can extract a continuous time_window rollout
             m = trainer.train_step(samples)
-            if (it + 1) % max(1, iters // 5) == 0:
+            if (it + 1) % max(1, s_iters // 5) == 0:
                 lp_str = f"  lpips={m['lpips']:.4f}" if m.get("lpips", 0.0) > 0.0 else ""
                 lr_str = f"  lr={m['lr']:.6f}" if "lr" in m else ""
                 rig_str = f"  rig={m['rigidity']:.5f}" if m.get("rigidity", 0.0) > 0.0 else ""
                 top_str = f"  topo={m['topology']:.5f}" if m.get("topology", 0.0) > 0.0 else ""
                 pde_str = f"  pde={m['pde']:.5f}" if m.get("pde", 0.0) > 0.0 else ""
-                print(f"  it {it+1}/{iters}  loss={m['loss']:.5f}  "
+                print(f"  it {it+1}/{s_iters}  loss={m['loss']:.5f}  "
                       f"photo={m['photo']:.5f}{lr_str}{lp_str}  rel_l2={m['rel_l2']:.5f}{rig_str}{top_str}{pde_str}")
         trainer.save(tag=stage)
 
