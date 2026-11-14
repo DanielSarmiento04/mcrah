@@ -112,7 +112,7 @@ def run_category(cfg: Config, category: str, args) -> dict:
 
     # ---- Phase 1: static 3DGS init ----------------------------------- #
     cloud_path = out_dir / "static_cloud.pt"
-    if args.skip_static and cloud_path.exists():
+    if (args.skip_static or getattr(args, "resume", False)) and cloud_path.exists():
         print(f"[{category}] loading existing static cloud")
         cloud = load_cloud(cloud_path, device=device)
     else:
@@ -143,6 +143,13 @@ def run_category(cfg: Config, category: str, args) -> dict:
 
     # ---- Phase 3: decoupled two-stage training ----------------------- #
     trainer = MCRAHTrainer(cfg, cloud, out_dir=out_dir / "runs")
+    if getattr(args, "resume", False):
+        for tag in ("joint", "farfield", "dense"):
+            ckpt_p = out_dir / "runs" / f"checkpoint_{tag}.pt"
+            if ckpt_p.exists():
+                print(f"[{category}] resuming weights from {ckpt_p} (strict=False)")
+                trainer.load(ckpt_p, strict=False)
+                break
 
     stages = ["dense", "farfield", "joint"] if not args.stage else [args.stage]
     iters = args.iterations
@@ -302,6 +309,8 @@ def main():
                    help="disable adaptive hypergraph (run static DVHGNN CVPR baseline arm)")
     p.add_argument("--skip-static", action="store_true",
                    help="reuse existing static cloud if present")
+    p.add_argument("--resume", action="store_true",
+                   help="reuse static_cloud.pt and warm-start from existing checkpoint_{joint,farfield,dense}.pt")
     p.add_argument("--quick", action="store_true",
                    help="fast smoke run (few iters, few samples)")
     args = p.parse_args()

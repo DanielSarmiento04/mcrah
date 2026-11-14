@@ -576,13 +576,19 @@ class MCRAHTrainer:
         torch.save(payload, path)
         return path
 
-    def load(self, path: str | Path) -> None:
+    def load(self, path: str | Path, strict: bool = False) -> None:
         ckpt = torch.load(Path(path), map_location=self.device,
                           weights_only=False)
-        self.model.load_state_dict(ckpt["model"])
+        self.model.load_state_dict(ckpt["model"], strict=strict)
         self.state.__dict__.update(ckpt["state"])
         self.set_stage(self.state.stage)
         if "optimizer" in ckpt:
-            self._opt.load_state_dict(ckpt["optimizer"])
+            try:
+                self._opt.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                pass
         if "scheduler" in ckpt and self._scheduler is not None:
-            self._scheduler.load_state_dict(ckpt["scheduler"])
+            try:
+                self._scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                pass
