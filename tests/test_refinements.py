@@ -222,3 +222,24 @@ def test_all_three_stages_train_step(tiny_cloud, cfg):
         m = trainer.train_step(samples)
         assert "loss" in m
         assert m["loss"] > 0.0
+
+
+def test_recycle_dead_gaussians_handles_0d_params(tiny_cloud, cfg):
+    """_recycle_dead_gaussians safely resets momentum without choking on 0D scalar params."""
+    trainer = MCRAHTrainer(cfg, tiny_cloud, out_dir="/tmp/mcrah_test_recycle")
+    trainer.set_stage("joint", total_steps=10)
+    # Mark first 10 Gaussians as dead and rest as active
+    with torch.no_grad():
+        trainer.model._cloud_opacities.data[:10] = -4.0
+        trainer.model._cloud_opacities.data[10:] = 1.5
+    K = torch.tensor([[400.0, 0.0, 100.0], [0.0, 400.0, 100.0], [0.0, 0.0, 1.0]])
+    c2w = torch.eye(4); c2w[2, 3] = -4.0
+    img = torch.rand(3, 32, 32)
+    samples = [
+        SceneSample(category="x", time=0.0, time_idx=0, image=img, c2w=c2w, intrinsics=K),
+        SceneSample(category="x", time=0.1, time_idx=1, image=img, c2w=c2w, intrinsics=K),
+    ]
+    trainer.train_step(samples)
+    deltas = [torch.randn(tiny_cloud.n, 3) * 0.05]
+    trainer._recycle_dead_gaussians(deltas)
+    assert (trainer.model._cloud_opacities.data[:10] > 0.0).all()

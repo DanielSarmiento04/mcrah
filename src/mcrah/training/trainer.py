@@ -491,7 +491,7 @@ class MCRAHTrainer:
         active_mask = op_flat > 0.2
         n_dead = int(dead_mask.sum().item())
         n_active = int(active_mask.sum().item())
-        if n_dead < 8 or n_active < 32:
+        if n_dead < 4 or n_active < 16:
             return
 
         dead_idx = torch.where(dead_mask)[0]
@@ -539,15 +539,21 @@ class MCRAHTrainer:
             )
             self.model.mcrah.centroid_0.copy_(new_c0)
 
-        # Reset Adam momentum for recycled indices
-        for group in self._opt.param_groups:
-            for p in group["params"]:
-                st = self._opt.state.get(p)
-                if st is not None and p.shape[0] == self.model.cloud.n:
-                    if "exp_avg" in st:
-                        st["exp_avg"][dead_idx] = 0.0
-                    if "exp_avg_sq" in st:
-                        st["exp_avg_sq"][dead_idx] = 0.0
+        # Reset Adam momentum for recycled canonical cloud indices
+        cloud_tensors = (
+            self.model._cloud_means,
+            self.model._cloud_scales,
+            self.model._cloud_rotations,
+            self.model._cloud_sh,
+            self.model._cloud_opacities,
+        )
+        for p in cloud_tensors:
+            st = self._opt.state.get(p)
+            if st is not None and p.ndim >= 1 and p.shape[0] == self.model.cloud.n:
+                if "exp_avg" in st and st["exp_avg"].ndim >= 1 and st["exp_avg"].shape[0] == self.model.cloud.n:
+                    st["exp_avg"][dead_idx] = 0.0
+                if "exp_avg_sq" in st and st["exp_avg_sq"].ndim >= 1 and st["exp_avg_sq"].shape[0] == self.model.cloud.n:
+                    st["exp_avg_sq"][dead_idx] = 0.0
 
     @torch.no_grad()
     def eval_step(self, samples: List[SceneSample]) -> Dict[str, float]:
