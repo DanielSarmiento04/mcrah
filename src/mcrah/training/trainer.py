@@ -37,7 +37,7 @@ from ..models.hypergraph import (
     DilatedStructure, Hypergraph, build_hypergraph_from_features,
     load_dilated_structure, load_hypergraph,
 )
-from ..models.mcrah import RigidityLoss, TopologySmoothnessLoss
+from ..models.mcrah import OrthogonalityLoss, RigidityLoss, TopologySmoothnessLoss
 
 
 @dataclass
@@ -95,6 +95,7 @@ class MCRAHTrainer:
         # MCRAH novel-module losses.
         self.rigidity_loss = RigidityLoss()
         self.topo_loss = TopologySmoothnessLoss()
+        self.orth_loss = OrthogonalityLoss()
 
         self._lpips_module = None
         self._scheduler = None
@@ -348,23 +349,42 @@ class MCRAHTrainer:
         # MCRAH novel losses (only if adaptive hypergraph is active).
         rig = pred.new_zeros((), dtype=torch.float32)
         topo = pred.new_zeros((), dtype=torch.float32)
+        orth = pred.new_zeros((), dtype=torch.float32)
+        jepa = pred.new_zeros((), dtype=torch.float32)
         mc = cfg.mcrah_loss
         if (steps is not None and self.cfg.hypergraph.adaptive
                 and self.model.mcrah is not None):
-            memberships = [s.membership for s in steps if s.membership is not None]
-            clouds_t = [s.cloud for s in steps if s.membership is not None]
-            if memberships:
+            mc_steps = [s for s in steps if s.membership is not None]
+            if mc_steps:
                 ref0 = self.model.mcrah.means_0
                 assign0 = self.model.mcrah.hypergraph.assignment_0
-                # Rigidity: displacement should match cluster centroid displacement.
+                # SO(3)-invariant SE(3) rigidity: penalize only non-rigid residual
                 rig = sum(
-                    self.rigidity_loss(c.means, ref0, m, assign0)
-                    for m, c in zip(memberships, clouds_t)) / len(memberships)
-                # Topology smoothness: membership should not jump between steps.
-                if len(memberships) >= 2:
+                    self.rigidity_loss(
+                        s.cloud.means, ref0, s.membership, assign0,
+                        expected_disp=getattr(s, "delta_pos_se3", None),
+                    )
+                    for s in mc_steps
+                ) / len(mc_steps)
+                # Hyperedge subspace orthogonality (M_norm^T M_norm ~ I_E)
+                orth = sum(self.orth_loss(s.membership) for s in mc_steps) / len(mc_steps)
+                # Topology smoothness & Hypergraph-JEPA latent dynamics
+                if len(mc_steps) >= 2:
                     topo = sum(
-                        self.topo_loss(memberships[i], memberships[i - 1])
-                        for i in range(1, len(memberships))) / (len(memberships) - 1)
+                        self.topo_loss(mc_steps[i].membership, mc_steps[i - 1].membership)
+                        for i in range(1, len(mc_steps))
+                    ) / (len(mc_steps) - 1)
+                    jepa_terms = []
+                    for i in range(len(mc_steps) - 1):
+                        z_curr = getattr(mc_steps[i], "edge_latents", None)
+                        z_next = getattr(mc_steps[i + 1], "edge_latents", None)
+                        t_curr = getattr(mc_steps[i], "time_val", None)
+                        t_next = getattr(mc_steps[i + 1], "time_val", None)
+                        if z_curr is not None and z_next is not None and t_curr is not None and t_next is not None:
+                            dt = (t_next - t_curr).abs()
+                            jepa_terms.append(self.model.mcrah.jepa.jepa_vicreg_loss(z_curr, z_next, dt))
+                    if jepa_terms:
+                        jepa = sum(jepa_terms) / len(jepa_terms)
 
         # Perceptual LPIPS loss + multi-view floater sparsity in farfield/joint stages
         lp_loss = pred.new_zeros((), dtype=torch.float32)
@@ -384,6 +404,8 @@ class MCRAHTrainer:
         loss = (photo + cfg.train.w_rel_l2 * rel + pde
                 + mc.rigidity_weight * rig
                 + mc.topology_smoothness_weight * topo
+                + getattr(mc, "orthogonality_weight", 0.0) * orth
+                + getattr(mc, "jepa_weight", 0.0) * jepa
                 + w_lpips * lp_loss
                 + joint_op_reg)
         metrics = {
@@ -394,6 +416,8 @@ class MCRAHTrainer:
             "pde": float(pde.item()),
             "rigidity": float(rig.item()),
             "topology": float(topo.item()),
+            "orth": float(orth.item()),
+            "jepa": float(jepa.item()),
         }
         return loss, metrics
 

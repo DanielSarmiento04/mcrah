@@ -46,6 +46,9 @@ class RolloutStep:
     delta_pos: torch.Tensor       # (N,3)
     delta_rot: Optional[torch.Tensor]  # (N,4) or None
     membership: Optional[torch.Tensor] = None  # (N,E) MCRAH soft membership
+    delta_pos_se3: Optional[torch.Tensor] = None  # (N,3) SE(3) rigid component
+    edge_latents: Optional[torch.Tensor] = None   # (E,D) Hypergraph-JEPA latents
+    time_val: Optional[torch.Tensor] = None       # scalar timestamp t
 
 
 class MCRAH(nn.Module):
@@ -162,7 +165,10 @@ class MCRAH(nn.Module):
         # SE(3) Hyperedge Articulation (Soft Hypergraph Linear Blend Skinning):
         # combines per-hyperedge rigid rotation around cluster pivots c_e^0 +
         # cluster translation b_e with fine per-node non-rigid residuals.
+        delta_pos_se3 = None
+        edge_latents = None
         if self.use_mcrah and self.mcrah is not None and membership is not None:
+            edge_latents = self.mcrah.jepa.pool_latents(h, membership)
             delta_pos_se3, rotvec_se3 = self.mcrah.articulate(h, membership)
             delta_pos = delta_pos + delta_pos_se3
             if delta_rot is not None:
@@ -180,6 +186,8 @@ class MCRAH(nn.Module):
         min_env = 0.20 if self.training else 0.02
         t_env = min_env + (1.0 - min_env) * (t_abs / 0.012).clamp(0.0, 1.0)
         delta_pos = delta_pos * t_env
+        if delta_pos_se3 is not None:
+            delta_pos_se3 = delta_pos_se3 * t_env
         if delta_scale is not None:
             delta_scale = delta_scale * t_env
         if delta_sh is not None:
@@ -189,8 +197,15 @@ class MCRAH(nn.Module):
             self.cloud, delta_pos, delta_rot,
             delta_scale=delta_scale, delta_sh=delta_sh,
         )
-        return RolloutStep(cloud=new_cloud, delta_pos=delta_pos,
-                          delta_rot=delta_rot, membership=membership)
+        return RolloutStep(
+            cloud=new_cloud,
+            delta_pos=delta_pos,
+            delta_rot=delta_rot,
+            membership=membership,
+            delta_pos_se3=delta_pos_se3,
+            edge_latents=edge_latents,
+            time_val=time.detach(),
+        )
 
     def rollout(self, times: List[torch.Tensor],
                 noise_injector=None) -> List[RolloutStep]:

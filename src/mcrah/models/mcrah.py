@@ -253,9 +253,17 @@ class RigidityLoss(nn.Module):
         means_0: torch.Tensor,          # (N, 3) reference positions
         membership: torch.Tensor,        # (N, E) soft membership
         assignment_0: torch.Tensor,      # (N,) initial assignment (for centroid)
+        expected_disp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         E = membership.shape[1]
         node_disp = means_t.float() - means_0.float()    # (N, 3)
+        if expected_disp is not None:
+            # SO(3)-invariant SE(3) rigidity: penalize only non-rigid residual
+            # beyond the hyperedge SE(3) rigid-body articulation field.
+            residual = node_disp - expected_disp.float()
+            res = (residual ** 2).sum(dim=-1).mean()
+            return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+
         M_f = membership.float()
 
         # Per-cluster centroid displacement (using initial assignment for scatter,
@@ -267,6 +275,87 @@ class RigidityLoss(nn.Module):
 
         residual = node_disp - expected                  # (N, 3)
         res = (residual ** 2).sum(dim=-1).mean()
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class OrthogonalityLoss(nn.Module):
+    """Hyperedge subspace orthogonality regularizer: || M_norm^T M_norm - I_E ||_F^2 / E.
+
+    Encourages the soft membership columns to span decoupled, orthogonal
+    kinematic subspaces so independent rigid bodies (e.g. bouncing spheres vs.
+    floor plate, or left vs. right limbs) do not mix during propagation.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, membership: torch.Tensor) -> torch.Tensor:
+        M = membership.float()                           # (N, E)
+        col_norms = M.norm(dim=0, keepdim=True).clamp_min(1e-6)
+        M_norm = M / col_norms
+        gram = M_norm.t() @ M_norm                       # (E, E)
+        E = M.shape[1]
+        eye = torch.eye(E, device=M.device, dtype=torch.float32)
+        res = ((gram - eye) ** 2).sum() / max(1, E)
+        return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class HypergraphJEPAPredictor(nn.Module):
+    """Hypergraph Joint-Embedding Predictive Architecture (Hypergraph-JEPA).
+
+    Pools node features into hyperedge latents z_e(t) in R^{E x D}, predicts
+    future hyperedge latents z_hat_e(t + dt) from (z_e(t), dt) in abstract
+    embedding space (with stop-gradient on the target), and applies VICReg
+    variance + off-diagonal covariance orthogonality to prevent representation
+    collapse.
+    """
+
+    def __init__(self, feat_dim: int = 64):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.pred_mlp = nn.Sequential(
+            nn.LayerNorm(feat_dim + 1),
+            nn.Linear(feat_dim + 1, feat_dim),
+            nn.SiLU(),
+            nn.Linear(feat_dim, feat_dim),
+        )
+        nn.init.normal_(self.pred_mlp[-1].weight, std=1e-3)
+        nn.init.zeros_(self.pred_mlp[-1].bias)
+
+    @staticmethod
+    def pool_latents(h: torch.Tensor, membership: torch.Tensor) -> torch.Tensor:
+        M = membership.float()
+        d_e = M.sum(dim=0).clamp_min(1.0).unsqueeze(-1)
+        return (M.t() @ h.float()) / d_e                 # (E, D)
+
+    def forward(self, z_t: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        E = z_t.shape[0]
+        dt_col = dt.to(device=z_t.device, dtype=z_t.dtype).reshape(1, 1).expand(E, 1)
+        return z_t + self.pred_mlp(torch.cat([z_t, dt_col], dim=-1))
+
+    def jepa_vicreg_loss(
+        self,
+        z_curr: torch.Tensor,
+        z_next: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        z_pred = self.forward(z_curr, dt)
+        z_tgt = z_next.detach()
+        pred_err = F.mse_loss(z_pred, z_tgt)
+
+        # VICReg covariance orthogonality across latent feature channels (D x D)
+        E, D = z_curr.shape
+        if E > 1:
+            zc = z_curr - z_curr.mean(dim=0, keepdim=True)
+            cov = (zc.t() @ zc) / max(1, E - 1)
+            off_diag = cov - torch.diag(torch.diag(cov))
+            cov_loss = (off_diag ** 2).sum() / max(1, D)
+            std = torch.sqrt(z_curr.var(dim=0, unbiased=False) + 1e-4)
+            var_loss = F.relu(0.5 - std).mean()
+        else:
+            cov_loss = z_curr.new_zeros(())
+            var_loss = z_curr.new_zeros(())
+        res = pred_err + 0.05 * cov_loss + 0.05 * var_loss
         return torch.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -386,6 +475,7 @@ class MCRAHCore(nn.Module):
         self.hypergraph = AdaptiveHypergraph(
             assignment_0, n_clusters, adaptive=adaptive)
         self.articulator = HyperedgeSE3Articulator(feat_dim=feat_dim)
+        self.jepa = HypergraphJEPAPredictor(feat_dim=feat_dim)
         # Store reference centroids (computed externally from t=0 means).
         self.register_buffer("centroid_0", torch.zeros(n_clusters, 3), persistent=False)
         self.register_buffer("means_0", torch.zeros(assignment_0.shape[0], 3),
@@ -434,6 +524,7 @@ class MCRAHCore(nn.Module):
         self.gate = self.gate.to(device)
         self.hypergraph = self.hypergraph.to(device)
         self.articulator = self.articulator.to(device)
+        self.jepa = self.jepa.to(device)
         self.centroid_0 = self.centroid_0.to(device)
         self.means_0 = self.means_0.to(device)
         return self

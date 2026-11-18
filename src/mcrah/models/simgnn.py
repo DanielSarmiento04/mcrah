@@ -125,7 +125,9 @@ class FeatureEncoder(nn.Module):
 
 
 class HGNNBlock(nn.Module):
-    """One hypergraph convolution block: Θ propagation + MLP + residual."""
+    """One orthogonal-spectral hypergraph convolution block:
+    combines low-pass propagation (Θ h) and its orthogonal high-pass
+    complement ((I - Θ) h) + MLP + residual."""
 
     def __init__(self, dim: int, dropout: float = 0.1):
         super().__init__()
@@ -133,23 +135,29 @@ class HGNNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.fc1 = nn.Linear(dim, dim * 2)
         self.fc2 = nn.Linear(dim * 2, dim)
+        self.hp_proj = nn.Linear(dim, dim)
+        nn.init.normal_(self.hp_proj.weight, std=1e-2)
+        nn.init.zeros_(self.hp_proj.bias)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, h: torch.Tensor, hypergraph) -> torch.Tensor:
-        # Normalized propagation (the Θ operator from hypergraph.py).
+        # Low-pass propagation Θ h + orthogonal high-pass complement (I - Θ) h
         propagated = hypergraph.propagate(h)
-        h = h + self.drop(propagated)                 # residual
+        high_pass = self.hp_proj(h - propagated)
+        h = h + self.drop(propagated + high_pass)     # residual
         h = h + self.drop(self._mlp(self.norm1(h)))
         return h
 
     def _propagate_mcrah(self, h: torch.Tensor, adaptive_hg) -> torch.Tensor:
         """Propagation through the MCRAH adaptive (soft) hypergraph.
 
-        Same structure as ``forward`` but uses the soft-membership Θ operator
-        so gradients flow through the membership gate.
+        Combines soft low-pass Θ h and orthogonal high-pass (I - Θ) h
+        so gradients flow through the membership gate while preserving
+        sharp motion discontinuities at articulated joints.
         """
         propagated = adaptive_hg.propagate(h)
-        h = h + self.drop(propagated)                 # residual
+        high_pass = self.hp_proj(h - propagated)
+        h = h + self.drop(propagated + high_pass)     # residual
         h = h + self.drop(self._mlp(self.norm1(h)))
         return h
 
@@ -232,7 +240,9 @@ class OffsetHeads(nn.Module):
         else:
             delta_scale = None
         if self.predict_sh:
-            delta_sh = (0.18 * torch.tanh(self.sh_head(h))) * damp
+            # Expanded range (±0.65) so bright surfaces (e.g. white floor plate
+            # in bouncingballs) can represent deep cast shadows cleanly.
+            delta_sh = (0.65 * torch.tanh(self.sh_head(h))) * damp
             delta_sh = torch.nan_to_num(delta_sh, nan=0.0)
         else:
             delta_sh = None

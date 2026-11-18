@@ -208,3 +208,28 @@ def test_se3_hyperedge_articulator(tiny_cloud):
     loss = (dp_se3 ** 2).sum() + (rv_se3 ** 2).sum()
     loss.backward()
     assert h.grad is not None and torch.isfinite(h.grad).all()
+
+
+def test_orthogonality_and_jepa_losses(tiny_cloud):
+    """OrthogonalityLoss and HypergraphJEPAPredictor produce finite, differentiable losses."""
+    from mcrah.models.mcrah import OrthogonalityLoss, HypergraphJEPAPredictor
+
+    hg = build_hypergraph_from_features(tiny_cloud.means, k=8, seed=0)
+    M = torch.nn.functional.one_hot(hg.assignment, num_classes=hg.n_edges).float()
+    orth_fn = OrthogonalityLoss()
+    # One-hot membership has strictly orthogonal columns => loss == 0
+    assert orth_fn(M).item() < 1e-6
+
+    # Overlapping soft membership => positive orthogonality loss
+    M_soft = (M + 0.2).softmax(dim=-1)
+    assert orth_fn(M_soft).item() > 0.0
+
+    jepa = HypergraphJEPAPredictor(feat_dim=32)
+    h0 = torch.randn(tiny_cloud.n, 32, requires_grad=True)
+    h1 = torch.randn(tiny_cloud.n, 32)
+    z0 = jepa.pool_latents(h0, M_soft)
+    z1 = jepa.pool_latents(h1, M_soft)
+    loss_jepa = jepa.jepa_vicreg_loss(z0, z1, torch.tensor(0.05))
+    assert torch.isfinite(loss_jepa) and loss_jepa.item() >= 0.0
+    loss_jepa.backward()
+    assert h0.grad is not None and torch.isfinite(h0.grad).all()

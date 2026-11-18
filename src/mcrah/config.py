@@ -70,8 +70,10 @@ class HypergraphConfig:
 @dataclass
 class MCRAHLossConfig:
     """Loss weights for the MCRAH novel-module regularizers."""
-    rigidity_weight: float = 2e-3    # quasi-rigid-body prior (gentle so rotating limbs aren't over-damped)
+    rigidity_weight: float = 2e-3    # SO(3)-invariant SE(3) rigidity prior
     topology_smoothness_weight: float = 2e-4  # temporal membership stability
+    orthogonality_weight: float = 2e-3  # hyperedge subspace orthogonality (M^T M ~ I)
+    jepa_weight: float = 1e-3           # Hypergraph-JEPA latent dynamics + VICReg
 
 
 @dataclass
