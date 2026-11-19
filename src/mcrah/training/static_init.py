@@ -270,7 +270,7 @@ def seed_cloud_from_views(
         # background (1.0 - pix_lum, critical for hellwarrior/hook/standup), and
         # bright skeletal details (pix_lum > 0.55).
         fg_contrast = (1.0 - pix_lum).clamp(0.0, 1.0)
-        weights = 1.0 + 4.5 * edge_mag + 1.5 * fg_contrast + 1.0 * (pix_lum > 0.55).float()
+        weights = 1.0 + 3.5 * edge_mag + 1.0 * fg_contrast + 1.2 * (pix_lum > 0.55).float()
 
         n_sample = min(rays_per_view, ys.numel())
         sampled_idx = torch.multinomial(weights, n_sample, replacement=(ys.numel() < n_sample))
