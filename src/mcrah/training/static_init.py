@@ -68,6 +68,7 @@ def seed_cloud_from_points(
     # every Gaussian black, so the rendered image is identical regardless of
     # position/opacity/scale, giving zero gradient and a completely flat loss.
     sh = torch.full((n, 3), 0.5, device=device)
+    sh_rest = torch.zeros((n, 8, 3), device=device)
     return GaussianCloud(
         means=means.to(device).detach().clone().requires_grad_(True),
         scales=log_scale.to(device).detach().clone().requires_grad_(True),
@@ -76,6 +77,7 @@ def seed_cloud_from_points(
         opacities=torch.zeros(n, 1, device=device).detach().clone()
         .requires_grad_(True),
         sh=sh.detach().clone().requires_grad_(True),
+        sh_rest=sh_rest.detach().clone().requires_grad_(True),
     )
 
 
@@ -413,6 +415,8 @@ class StaticGSInit:
             {"params": [cloud.opacities], "lr": cfg.static_gs.lr_opacity},
             {"params": [cloud.sh], "lr": 4.0e-3},
         ]
+        if cloud.sh_rest is not None:
+            params.append({"params": [cloud.sh_rest], "lr": 1.5e-3})
         if cfg.model.predict_rotation:
             params.append(
                 {"params": [cloud.rotations], "lr": lr_means_init})
@@ -420,7 +424,7 @@ class StaticGSInit:
 
         # Decoupled 3DGS schedules:
         # means & rotations: exponential decay from lr_init to lr_final (0.02x)
-        # scales, opacities, sh: sustained cosine decay down to 20% of initial lr
+        # scales, opacities, sh, sh_rest: sustained cosine decay down to 20% of initial lr
         gamma_means = (0.02) ** (1.0 / max(1, iters))
         sched_funcs = [
             lambda step: gamma_means ** step,                            # means
@@ -428,6 +432,10 @@ class StaticGSInit:
             lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # opacities
             lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters))),  # sh
         ]
+        if cloud.sh_rest is not None:
+            sched_funcs.append(
+                lambda step: 0.2 + 0.8 * 0.5 * (1.0 + math.cos(math.pi * step / max(1, iters)))
+            )
         if cfg.model.predict_rotation:
             sched_funcs.append(lambda step: gamma_means ** step)         # rotations
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=sched_funcs)
@@ -509,6 +517,8 @@ class StaticGSInit:
             with torch.no_grad():
                 cloud.scales.data.clamp_(-7.5, -3.10)
                 cloud.sh.data.clamp_(0.0, 1.0)
+                if cloud.sh_rest is not None:
+                    cloud.sh_rest.data.clamp_(-1.5, 1.5)
                 cloud.opacities.data.clamp_(-8.0, 5.0)
                 if (it + 1) in recycle_steps and cloud.n >= 500:
                     self._recycle_transparent_to_high_error(
@@ -530,6 +540,7 @@ class StaticGSInit:
                     rotations=cloud.rotations[valid_mask],
                     opacities=cloud.opacities[valid_mask],
                     sh=cloud.sh.data[valid_mask],
+                    sh_rest=None if cloud.sh_rest is None else cloud.sh_rest.data[valid_mask],
                 )
 
         # Detach the final substrate; MCRAH does not train it.
@@ -539,6 +550,7 @@ class StaticGSInit:
             rotations=quaternion_normalize(cloud.rotations.detach().clone()),
             opacities=cloud.opacities.detach().clone(),
             sh=cloud.sh.detach().clone(),
+            sh_rest=None if cloud.sh_rest is None else cloud.sh_rest.detach().clone(),
         )
         return StaticInitResult(cloud=final, history=history, iterations=iters)
 
@@ -595,12 +607,17 @@ class StaticGSInit:
         target_idx = dead_idx[:count]
         cloud.means.data[target_idx] = new_pts[:count] + torch.randn_like(new_pts[:count]) * 0.0008
         cloud.sh.data[target_idx] = new_cols[:count].clamp(0.0, 1.0)
+        if cloud.sh_rest is not None:
+            cloud.sh_rest.data[target_idx] = 0.0
         cloud.opacities.data[target_idx] = 0.85
         cloud.scales.data[target_idx] = -5.15
 
         # Reset Adam momentum (exp_avg, exp_avg_sq) for recycled Gaussians (3DGS convention)
         if opt is not None:
-            for p in (cloud.means, cloud.scales, cloud.opacities, cloud.sh, cloud.rotations):
+            tensors = [cloud.means, cloud.scales, cloud.opacities, cloud.sh, cloud.rotations]
+            if cloud.sh_rest is not None:
+                tensors.append(cloud.sh_rest)
+            for p in tensors:
                 st = opt.state.get(p)
                 if st is not None:
                     if "exp_avg" in st and st["exp_avg"].shape[0] == cloud.n:
@@ -613,18 +630,21 @@ def save_cloud(cloud: GaussianCloud, path: Path | str) -> None:
     """Save a static cloud to ``path`` as .pt (torch state-dict of tensors)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    payload = {
         "means": cloud.means.detach().cpu(),
         "scales": cloud.scales.detach().cpu(),
         "rotations": cloud.rotations.detach().cpu(),
         "opacities": cloud.opacities.detach().cpu(),
         "sh": cloud.sh.detach().cpu(),
-    }, path)
+    }
+    if cloud.sh_rest is not None:
+        payload["sh_rest"] = cloud.sh_rest.detach().cpu()
+    torch.save(payload, path)
 
 
 def load_cloud(path: Path | str, device: Optional[str] = None) -> GaussianCloud:
     d = torch.load(Path(path), map_location=device or "cpu", weights_only=True)
     return GaussianCloud(
         means=d["means"], scales=d["scales"], rotations=d["rotations"],
-        opacities=d["opacities"], sh=d["sh"],
+        opacities=d["opacities"], sh=d["sh"], sh_rest=d.get("sh_rest", None),
     )

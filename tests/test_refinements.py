@@ -243,3 +243,22 @@ def test_recycle_dead_gaussians_handles_0d_params(tiny_cloud, cfg):
     deltas = [torch.randn(tiny_cloud.n, 3) * 0.05]
     trainer._recycle_dead_gaussians(deltas)
     assert (trainer.model._cloud_opacities.data[:10] > 0.0).all()
+
+
+def test_view_dependent_sh_degree2(tiny_cloud):
+    """eval_sh_color produces view-dependent RGB colors with valid gradients."""
+    from mcrah.gs.gaussian import eval_sh_color
+
+    sh_dc = torch.full((tiny_cloud.n, 3), 0.5, requires_grad=True)
+    sh_rest = (torch.randn(tiny_cloud.n, 8, 3) * 0.2).requires_grad_(True)
+    cam_a = torch.tensor([0.0, 0.0, 4.0])
+    cam_b = torch.tensor([4.0, 0.0, 0.0])
+
+    rgb_a = eval_sh_color(sh_dc, sh_rest, tiny_cloud.means, cam_a)
+    rgb_b = eval_sh_color(sh_dc, sh_rest, tiny_cloud.means, cam_b)
+    assert rgb_a.shape == (tiny_cloud.n, 3)
+    assert (rgb_a >= 0.0).all() and (rgb_a <= 1.0).all()
+    assert not torch.allclose(rgb_a, rgb_b)
+
+    (rgb_a.sum() + rgb_b.sum()).backward()
+    assert sh_rest.grad is not None and sh_rest.grad.abs().sum() > 0.0

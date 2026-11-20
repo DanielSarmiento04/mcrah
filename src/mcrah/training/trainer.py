@@ -149,7 +149,7 @@ class MCRAHTrainer:
         cloud_op_params = []
         cloud_names = {
             "_cloud_means", "_cloud_rotations",
-            "_cloud_scales", "_cloud_sh", "_cloud_opacities",
+            "_cloud_scales", "_cloud_sh", "_cloud_sh_rest", "_cloud_opacities",
         }
         for name, p in self.model.named_parameters():
             if p.requires_grad:
@@ -475,6 +475,8 @@ class MCRAHTrainer:
             with torch.no_grad():
                 self.model._cloud_scales.data.clamp_(-7.5, -3.10)
                 self.model._cloud_sh.data.clamp_(0.0, 1.0)
+                if hasattr(self.model, "_cloud_sh_rest"):
+                    self.model._cloud_sh_rest.data.clamp_(-1.5, 1.5)
                 # Suppress transparent mid-air floaters (logit < -3.0 -> -8.0)
                 op_data = self.model._cloud_opacities.data
                 op_data.clamp_(-8.0, 5.0)
@@ -542,6 +544,8 @@ class MCRAHTrainer:
             + torch.randn_like(self.model._cloud_means.data[src_idx]) * 0.0025
         )
         self.model._cloud_sh.data[dead_idx] = self.model._cloud_sh.data[src_idx].clone()
+        if hasattr(self.model, "_cloud_sh_rest"):
+            self.model._cloud_sh_rest.data[dead_idx] = self.model._cloud_sh_rest.data[src_idx].clone()
         self.model._cloud_rotations.data[dead_idx] = self.model._cloud_rotations.data[src_idx].clone()
         self.model._cloud_scales.data[dead_idx] = (
             self.model._cloud_scales.data[src_idx] - 0.20
@@ -564,13 +568,15 @@ class MCRAHTrainer:
             self.model.mcrah.centroid_0.copy_(new_c0)
 
         # Reset Adam momentum for recycled canonical cloud indices
-        cloud_tensors = (
+        cloud_tensors = [
             self.model._cloud_means,
             self.model._cloud_scales,
             self.model._cloud_rotations,
             self.model._cloud_sh,
             self.model._cloud_opacities,
-        )
+        ]
+        if hasattr(self.model, "_cloud_sh_rest"):
+            cloud_tensors.append(self.model._cloud_sh_rest)
         for p in cloud_tensors:
             st = self._opt.state.get(p)
             if st is not None and p.ndim >= 1 and p.shape[0] == self.model.cloud.n:

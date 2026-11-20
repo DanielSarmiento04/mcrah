@@ -116,13 +116,19 @@ class MCRAH(nn.Module):
         self._cloud_rotations = nn.Parameter(cloud.rotations.clone(), requires_grad=False)
         self._cloud_opacities = nn.Parameter(cloud.opacities.clone(), requires_grad=False)
         self._cloud_sh = nn.Parameter(cloud.sh.clone(), requires_grad=False)
+        sh_rest = (
+            cloud.sh_rest.clone()
+            if cloud.sh_rest is not None
+            else torch.zeros(cloud.n, 8, 3, device=cloud.means.device, dtype=cloud.means.dtype)
+        )
+        self._cloud_sh_rest = nn.Parameter(sh_rest, requires_grad=False)
 
     @property
     def cloud(self) -> GaussianCloud:
         return GaussianCloud(
             means=self._cloud_means, scales=self._cloud_scales,
             rotations=self._cloud_rotations, opacities=self._cloud_opacities,
-            sh=self._cloud_sh,
+            sh=self._cloud_sh, sh_rest=self._cloud_sh_rest,
         )
 
     # -- forward ----------------------------------------------------------- #
@@ -233,7 +239,7 @@ class MCRAH(nn.Module):
         noisy_means = noise(cloud.means)
         return GaussianCloud(
             means=noisy_means, scales=cloud.scales, rotations=cloud.rotations,
-            opacities=cloud.opacities, sh=cloud.sh,
+            opacities=cloud.opacities, sh=cloud.sh, sh_rest=cloud.sh_rest,
         )
 
     # -- stage control (rules.md Rule 8 decoupled training) --------------- #
@@ -255,7 +261,7 @@ class MCRAH(nn.Module):
         # In farfield & joint stages, allow canonical 3D geometry & appearance
         # to refine across all 200 multi-view training cameras.
         refine_cloud = stage in ("farfield", "joint")
-        for attr in ("_cloud_means", "_cloud_rotations", "_cloud_scales", "_cloud_sh", "_cloud_opacities"):
+        for attr in ("_cloud_means", "_cloud_rotations", "_cloud_scales", "_cloud_sh", "_cloud_sh_rest", "_cloud_opacities"):
             if hasattr(self, attr):
                 getattr(self, attr).requires_grad = refine_cloud
 

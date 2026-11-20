@@ -36,7 +36,7 @@ from typing import Optional
 
 import torch
 
-from .gaussian import GaussianCloud, rotation_to_matrix
+from .gaussian import GaussianCloud, eval_sh_color, rotation_to_matrix
 
 
 # --------------------------------------------------------------------------- #
@@ -171,8 +171,11 @@ class PyTorchRasterizer(Rasterizer):
         on_screen = front & (u + r_int >= 0) & (u - r_int < width) & \
             (v + r_int >= 0) & (v - r_int < height)
 
+        campos = c2w[:3, 3]
+        color_rgb = eval_sh_color(g.sh, g.sh_rest, g.means, campos)
+
         return dict(
-            u=u, v=v, z=z, color=g.sh, opacity=g.opacities[:, 0],
+            u=u, v=v, z=z, color=color_rgb, opacity=g.opacities[:, 0],
             conic=conic, radius=radius, r_int=r_int, valid=on_screen,
         )
 
@@ -384,6 +387,7 @@ class CUDAGaussianRasterizer(Rasterizer):
                 rotations=cloud.rotations.to(device=device, dtype=dtype),
                 opacities=cloud.opacities.to(device=device, dtype=dtype),
                 sh=cloud.sh.to(device=device, dtype=dtype),
+                sh_rest=None if cloud.sh_rest is None else cloud.sh_rest.to(device=device, dtype=dtype),
             ).activated()
 
             # World-to-camera from c2w (OpenCV convention: x-right, y-down, z-fwd).
@@ -430,7 +434,7 @@ class CUDAGaussianRasterizer(Rasterizer):
                 means3D, dtype=torch.float32, requires_grad=means3D.requires_grad
             )
             opacity = g.opacities.contiguous().float()
-            colors = g.sh.contiguous().float()              # (N,3) DC RGB
+            colors = eval_sh_color(g.sh, g.sh_rest, g.means, campos).contiguous().float()
             scales = g.scales.contiguous().float()          # (N, 3) activated
             rotations = g.rotations.contiguous().float()     # (N, 4) normalized
 

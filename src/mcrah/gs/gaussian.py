@@ -11,9 +11,57 @@ A Gaussian cloud stores the standard 3DGS attributes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+# Real Spherical Harmonics constants for degrees 1 and 2
+_SH_C1 = 0.4886025119029199
+_SH_C2 = (
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396,
+)
+
+
+def eval_sh_color(
+    sh_dc: torch.Tensor,
+    sh_rest: Optional[torch.Tensor],
+    means: torch.Tensor,
+    campos: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate view-dependent RGB color from DC + degree-1/2 SH coefficients.
+
+    Args:
+        sh_dc: (N, 3) base DC color (degree 0).
+        sh_rest: optional (N, 8, 3) degree-1 (3) + degree-2 (5) SH coefficients.
+        means: (N, 3) Gaussian 3D centers in world space.
+        campos: (3,) camera position in world space.
+    Returns: (N, 3) clamped view-dependent RGB color in [0, 1].
+    """
+    if sh_rest is None:
+        return torch.clamp(sh_dc, 0.0, 1.0)
+    dirs = means - campos.view(1, 3).to(device=means.device, dtype=means.dtype)
+    dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    x, y, z = dirs.unbind(-1)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+    basis = torch.stack([
+        -_SH_C1 * y,
+        _SH_C1 * z,
+        -_SH_C1 * x,
+        _SH_C2[0] * xy,
+        _SH_C2[1] * yz,
+        _SH_C2[2] * (2.0 * zz - xx - yy),
+        _SH_C2[3] * xz,
+        _SH_C2[4] * (xx - yy),
+    ], dim=-1)  # (N, 8)
+    k = min(sh_rest.shape[1], basis.shape[1])
+    view_delta = (sh_rest[:, :k, :] * basis[:, :k].unsqueeze(-1)).sum(dim=1)
+    return torch.clamp(sh_dc + view_delta, 0.0, 1.0)
 
 
 def rotation_to_matrix(q: torch.Tensor) -> torch.Tensor:
@@ -56,7 +104,8 @@ class GaussianCloud:
     scales: torch.Tensor      # (N,3)  log-scale (pre-activation)
     rotations: torch.Tensor   # (N,4)  quaternion
     opacities: torch.Tensor    # (N,1)  logit (pre-activation)
-    sh: torch.Tensor          # (N,3) DC term only (degree 0); extensible.
+    sh: torch.Tensor          # (N,3) DC term (degree 0)
+    sh_rest: Optional[torch.Tensor] = None  # (N,8,3) view-dependent SH (deg 1 & 2)
 
     @property
     def n(self) -> int:
@@ -74,12 +123,14 @@ class GaussianCloud:
             rotations=quaternion_normalize(self.rotations),
             opacities=torch.sigmoid(self.opacities),
             sh=torch.clamp(self.sh, 0.0, 1.0),
+            sh_rest=self.sh_rest,
         )
 
     def to(self, device) -> "GaussianCloud":
         return GaussianCloud(
             self.means.to(device), self.scales.to(device), self.rotations.to(device),
             self.opacities.to(device), self.sh.to(device),
+            None if self.sh_rest is None else self.sh_rest.to(device),
         )
 
     def detach_clone(self) -> "GaussianCloud":
@@ -87,6 +138,7 @@ class GaussianCloud:
             self.means.detach().clone(), self.scales.detach().clone(),
             self.rotations.detach().clone(), self.opacities.detach().clone(),
             self.sh.detach().clone(),
+            None if self.sh_rest is None else self.sh_rest.detach().clone(),
         )
 
     @classmethod
@@ -115,7 +167,7 @@ def transform_gaussians(cloud: GaussianCloud, c2w: torch.Tensor) -> GaussianClou
     new_rot = _matrix_to_quaternion(new_R)
     return GaussianCloud(
         means=new_means, scales=cloud.scales, rotations=new_rot,
-        opacities=cloud.opacities, sh=cloud.sh,
+        opacities=cloud.opacities, sh=cloud.sh, sh_rest=cloud.sh_rest,
     )
 
 
@@ -164,4 +216,5 @@ def apply_offsets(
         rotations=rot,
         opacities=torch.nan_to_num(opacities, nan=0.0),
         sh=torch.nan_to_num(sh, nan=0.0),
+        sh_rest=cloud.sh_rest,
     )
